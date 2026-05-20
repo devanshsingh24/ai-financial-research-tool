@@ -1,0 +1,12 @@
+langchain
+langchain-text-splitters 
+langchain-community 
+langchain-ollama
+faiss-cpu 
+sentence-transformers 
+unstructured 
+tiktoken
+pandas
+numpy
+streamlit
+langgraph
