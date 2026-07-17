@@ -9,6 +9,9 @@ Local RAG-based AI Financial Analyst using LangGraph, Ollama & Streamlit. It is 
 
 ![App Screenshot](https://cdn.corenexis.com/f/OEE6KQbCV3b.png)
 
+## Demo 
+Watch the 1 minute demonstration on **X**
+![Watch the demonstration here](https://x.com/DevanshSin52865/status/2056979625105137869)
 
 ## Features
 
