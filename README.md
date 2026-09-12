@@ -1,6 +1,6 @@
 
-# AI-Financial-Research-Tool
-Local RAG-based AI Financial Analyst using LangGraph, Ollama & Streamlit. It is a user-friendly news research tool designed for effortless information retrieval. Users can input article URLs and ask questions to receive relevant insights from the stock market and financial domain.
+# FinSight — AI Financial Research Terminal
+Local RAG-based financial research with a Next.js dashboard, FastAPI, LangGraph, Ollama, and FAISS. Add your own article URLs and receive answers grounded in those sources.
 
 
 
@@ -9,9 +9,6 @@ Local RAG-based AI Financial Analyst using LangGraph, Ollama & Streamlit. It is 
 
 ![App Screenshot](https://cdn.corenexis.com/f/OEE6KQbCV3b.png)
 
-## Demo 
-Watch the 1 minute demonstration on **X**
-[![X](https://img.shields.io/badge/X-black.svg?logo=X&logoColor=white)](https://x.com/DevanshSin52865/status/2056979625105137869)
 
 ## Features
 
@@ -23,11 +20,26 @@ Watch the 1 minute demonstration on **X**
 
 ## Usage/Examples
 
-1. Run the Streamlit app by executing:
+1. Install the API and dashboard dependencies:
 
-streamlit run main.py
+```powershell
+pip install -r requirements.txt
+npm install
+```
 
-2. The web app will open in your browser.
+2. Start the local research API in one terminal:
+
+```powershell
+uvicorn app:app --reload --port 8000
+```
+
+3. Start the Next.js dashboard in a second terminal:
+
+```powershell
+npm run dev
+```
+
+Open `http://localhost:3000`.
 
 - On the sidebar, you can input URLs directly.
 
@@ -43,7 +55,7 @@ streamlit run main.py
 
 In rag.ipynb file, we used following news articles
 
-    "https://www.moneycontrol.com/news/business/markets/wall-street-rises-as-tesla-soars-on-ai-optimism-11351111.html", 
+    "https://www.moneycontrol.com/news/business/markets/wall-street-rises-as-tesla-soars-on-ai-optimism-11351111.html",
     "https://www.moneycontrol.com/news/business/tata-motors-launches-punch-icng-price-starts-at-rs-7-1-lakh-11098751.html"
 
 
@@ -51,7 +63,7 @@ In rag.ipynb file, we used following news articles
 
 ┌─────────────────────┐
 │   User Interface    │
-│   (Streamlit)       │
+│    (Next.js)        │
 └──────────┬──────────┘
            │
            ▼
@@ -94,7 +106,7 @@ In rag.ipynb file, we used following news articles
 
 - FAISS Documentation
 
-- Streamlit Docs
+- Next.js Docs
 
 - Ollama Documentation
 
@@ -105,7 +117,7 @@ All models run locally via Ollama - no API keys needed
 
 FAISS index is persisted to disk for reuse
 
-Streamlit session state manages retriever across interactions
+The FastAPI service keeps the active retriever available across dashboard requests
 
 LangGraph provides deterministic workflow execution
 
@@ -122,7 +134,8 @@ langgraph -	Workflow orchestration
 
 faiss-cpu -	Vector similarity search
 
-streamlit -	Web UI framework
+fastapi - Local API framework
+next.js - Web UI framework
 
 sentence-transformers -	Embedding models
 
