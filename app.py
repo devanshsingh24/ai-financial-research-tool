@@ -9,7 +9,7 @@ from typing import List, TypedDict
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, HttpUrl
-from langchain_community.document_loaders import UnstructuredURLLoader
+from langchain_community.document_loaders import WebBaseLoader
 from langchain_community.vectorstores import FAISS
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
@@ -121,7 +121,7 @@ def process_urls(payload: ProcessRequest) -> ProcessResponse:
     global retriever
     urls = [str(url) for url in payload.urls]
     try:
-        documents = UnstructuredURLLoader(urls=urls).load()
+        documents = WebBaseLoader(web_paths=tuple(urls)).load()
         if not documents:
             raise ValueError("No readable content was found at the supplied URLs.")
         chunks = RecursiveCharacterTextSplitter(

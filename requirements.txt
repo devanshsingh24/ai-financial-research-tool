@@ -5,6 +5,7 @@ langchain-ollama
 faiss-cpu 
 sentence-transformers 
 unstructured 
+beautifulsoup4
 tiktoken
 pandas
 numpy
