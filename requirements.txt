@@ -8,5 +8,6 @@ unstructured
 tiktoken
 pandas
 numpy
-streamlit
 langgraph
+fastapi
+uvicorn[standard]
