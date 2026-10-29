@@ -2,17 +2,22 @@
 __pycache__/
 *.pyc
 *.pyo
-
+.ipynb_checkpoints/
 
 # Virtual environments
+.venv/
 venv/
 
+# Next.js / Node
+node_modules/
+.next/
+*.tsbuildinfo
 
-# FAISS index (large binary files)
+# FAISS index (large binary files, rebuilt from the dashboard)
 faiss_index/
 
-# Jupyter checkpoints
-.ipynb_checkpoints/
+# Logs
+*.log
 
 # OS files
 .DS_Store

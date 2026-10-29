@@ -60,9 +60,7 @@ embeddings = OllamaEmbeddings(model="nomic-embed-text")
 retriever = None
 
 prompt = ChatPromptTemplate.from_template(
-    """You are a precise financial research assistant. Answer only from the supplied
-context. If the context does not support an answer, say so clearly. Keep the answer
-concise and do not invent market data.
+    """You are a precise financial research assistant. Answer only from the supplied context. If the context does not support an answer, say so clearly. Keep the answer concise and do not invent market data. 
 
 Context:
 {context}

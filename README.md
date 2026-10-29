@@ -1,39 +1,39 @@
-
 # FinSight — AI Financial Research Terminal
-Local RAG-based financial research with a Next.js dashboard, FastAPI, LangGraph, Ollama, and FAISS. Add your own article URLs and receive answers grounded in those sources.
 
-
-
-
-
+Local RAG-based financial research with a Next.js dashboard, FastAPI, LangGraph, Ollama and FAISS. Add your own article URLs and get answers grounded in those sources, with links back to them. Everything runs on your machine; no API keys are needed.
 
 ![App Screenshot](https://cdn.corenexis.com/f/OEE6KQbCV3b.png)
 
-
 ## Features
 
-- Load URLs or upload text files containing URLs to fetch article content.
-- Process article content through LangChain's UnstructuredURL Loader
-- Construct an embedding vector using  OllamaEmbeddings and leverage FAISS, a powerful similarity search library, to enable swift and effective retrieval of relevant information
-- Interact with the LLM's (Chatgpt) by inputting queries and receiving answers along with source URLs.
+- Paste up to 10 news or market-analysis URLs; the article text is fetched with LangChain's `WebBaseLoader`.
+- Text is split into overlapping chunks, embedded with Ollama `nomic-embed-text` and indexed in FAISS.
+- The index is saved to `faiss_index/` and reloaded automatically when the API restarts.
+- Questions are answered by a local Ollama `llama3` model via a LangGraph `retrieve → generate` workflow, with the source URLs listed under the answer.
 
+## Setup
 
-## Usage/Examples
+1. Install [Ollama](https://ollama.com) and pull the models:
 
-1. Install the API and dashboard dependencies:
+```powershell
+ollama pull llama3
+ollama pull nomic-embed-text
+```
+
+2. Install the API and dashboard dependencies:
 
 ```powershell
 pip install -r requirements.txt
 npm install
 ```
 
-2. Start the local research API in one terminal:
+3. Start the research API from the repo root:
 
 ```powershell
 uvicorn app:app --reload --port 8000
 ```
 
-3. Start the Next.js dashboard in a second terminal:
+4. Start the Next.js dashboard in a second terminal:
 
 ```powershell
 npm run dev
@@ -41,104 +41,48 @@ npm run dev
 
 Open `http://localhost:3000`.
 
-- On the sidebar, you can input URLs directly.
+## Usage
 
-- Initiate the data loading and processing by clicking "Process URLs."
+1. Under **Research collection**, paste one or more article URLs and click **Create research collection**.
+2. Wait for the "passages indexed" message. Note: each new collection **replaces** the previous index.
+3. Ask a question in the **Research terminal**. The answer appears with its source links.
 
-- Observe the system as it performs text splitting, generates embedding vectors, and efficiently indexes them using FAISS.
+## Architecture
 
-- The embeddings will be stored and indexed using FAISS, enhancing retrieval speed.
+```
+Next.js dashboard (app/page.tsx, :3000)
+        │  POST /api/process  {urls}
+        │  POST /api/query    {question}
+        ▼
+FastAPI (app.py, :8000)
+  process: WebBaseLoader → text splitter → nomic-embed-text → FAISS (saved to faiss_index/)
+  qu
+```
 
-- The FAISS index will be saved in a local file path in pickle format for future use.
+| Endpoint | Purpose |
+|---|---|
+| `GET /health` | Status and whether an index is loaded |
+| `POST /api/process` | Fetch, chunk, embed and index URLs |
+| `POST /api/query` | Answer a question from the indexed sources |
 
-- One can now ask a question and get the answer based on those news articles
+## Project layout
 
-In rag.ipynb file, we used following news articles
+| Path | Contents |
+|---|---|
+| `app.py` | FastAPI backend and LangGraph RAG pipeline |
+| `app/` | Next.js dashboard (single page) |
+| `faiss_index/` | Saved FAISS index |
+| `rag.ipynb` | Original notebook prototype of the pipeline (uses `UnstructuredURLLoader`) |
+| `Presentation/` | College presentation deck and the script that generates it |
+| `postcleanup.md` | Record of cleaned-up files and known issues |
 
-    "https://www.moneycontrol.com/news/business/markets/wall-street-rises-as-tesla-soars-on-ai-optimism-11351111.html",
-    "https://www.moneycontrol.com/news/business/tata-motors-launches-punch-icng-price-starts-at-rs-7-1-lakh-11098751.html"
+## Tech stack
 
-
-## Roadmap
-
-┌─────────────────────┐
-│   User Interface    │
-│    (Next.js)        │
-└──────────┬──────────┘
-           │
-           ▼
-┌─────────────────────┐
-│   URL Processing    │
-│  (Load & Split)     │
-└──────────┬──────────┘
-           │
-           ▼
-┌─────────────────────┐
-│   Embedding Gen     │
-│   (Ollama Embed)    │
-└──────────┬──────────┘
-           │
-           ▼
-┌─────────────────────┐
-│  FAISS Vector Store │
-│   (Similarity)      │
-└──────────┬──────────┘
-           │
-        ┌──┴──┐
-        │     │
-    ┌───▼─┐ ┌┴────────┐
-    │Query│ │LLM Prompt
-    └───┬─┘ └┬────────┘
-        │    │
-        └─┬──┘
-          │
-          ▼
-    ┌──────────────┐
-    │Answer + Src  │
-    └──────────────┘
-
-
-## Documentation
-
-- LangChain Docs
-
-- LangGraph Docs
-
-- FAISS Documentation
-
-- Next.js Docs
-
-- Ollama Documentation
-
-
-## Notes
-
-All models run locally via Ollama - no API keys needed
-
-FAISS index is persisted to disk for reuse
-
-The FastAPI service keeps the active retriever available across dashboard requests
-
-LangGraph provides deterministic workflow execution
-
-RAG ensures answers are grounded in provided documents
-
-## Dependencies
-
-
-langchain -	LLM framework
-
-langchain-ollama -	Ollama integration
-
-langgraph -	Workflow orchestration
-
-faiss-cpu -	Vector similarity search
-
-fastapi - Local API framework
-next.js - Web UI framework
-
-sentence-transformers -	Embedding models
-
-pandas - Data manipulation
-
-unstructured -	Document loading
+| Package | Role |
+|---|---|
+| LangChain + `langchain-ollama` | Loaders, splitters, Ollama LLM and embeddings |
+| LangGraph | Retrieve → generate workflow |
+| FAISS (`faiss-cpu`) | Vector similarity search |
+| FastAPI + Uvicorn | Local research API |
+| Next.js 15 / React 19 / TypeScript | Dashboard UI |
+| Ollama (`llama3`, `nomic-embed-text`) | Local LLM and embedding models |
