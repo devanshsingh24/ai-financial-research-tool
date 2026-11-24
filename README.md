@@ -11,7 +11,7 @@ Local RAG-based financial research with a Next.js dashboard, FastAPI, LangGraph,
 - The index is saved to `backend/faiss_index/` and reloaded automatically when the API restarts.
 - Questions are answered by a local Ollama `llama3` model via a LangGraph `retrieve → generate` workflow, with the source URLs listed under the answer.
 - Answers stream in live, word by word with a typing cursor, like a chat app. The source links appear as soon as retrieval finishes, before the answer starts.
-- **Web-search fallback (API).** `/ask` answers from your sources for free. If the answer needs fresh data or the sources don't cover it, the request pauses and asks *"Search the web? (1 credit)"*. `/confirm` then runs **one** Tavily search and returns an answer citing the web URLs, or returns the local draft marked as unverified. Results are cached, so repeating a search costs 0 credits.
+- **Web-search fallback** (dashboard toggle + API). `/ask` answers from your sources for free. If the answer needs fresh data or the sources don't cover it, the request pauses and asks *"Search the web? (1 credit)"*. `/confirm` then runs **one** Tavily search and returns an answer citing the web URLs, or returns the local draft marked as unverified. Results are cached, so repeating a search costs 0 credits.
 
 ## Setup
 
@@ -51,6 +51,17 @@ Open `http://localhost:3000`.
 1. Under **Research collection**, paste one or more article URLs and click **Create research collection**.
 2. Wait for the "passages indexed" message. Note: each new collection **replaces** the previous index.
 3. Ask a question in the **Research terminal**. The answer appears with its source links.
+
+### Web search (Web fallback toggle)
+
+The **Web fallback** switch sits at the top right of the Research terminal and is on by default.
+
+- **On:** FinSight first answers from your sources (0 credits, tagged **YOUR SOURCES**). If they can't answer, for example on today's price or recent news, a card shows the **draft** with two buttons:
+  - **Search the web**: runs one Tavily search (1 credit, or 0 if cached). The answer is tagged **WEB · 1 CREDIT**, shows the search query, and lists numbered sources `[1]…[5]` that match the citations in the text.
+  - **No, use draft**: no search. The draft is shown and tagged **UNVERIFIED**.
+- **Off:** answers stream live from your sources only. No web search is offered.
+
+Web search needs `TAVILY_API_KEY` in `.env` (see Setup).
 
 ## Architecture
 
