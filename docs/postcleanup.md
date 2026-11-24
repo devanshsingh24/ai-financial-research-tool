@@ -46,7 +46,7 @@ Deliberately kept:
 3. **Unsafe deserialization flag:** `FAISS.load_local(..., allow_dangerous_deserialization=True)` is fine for a local index you created, but never load an index file from an untrusted source.
 4. **Unused dependencies:** `requirements.txt` lists `sentence-transformers`, `pandas`, `numpy` and `tiktoken`, which neither `app.py` nor `rag.ipynb` imports. `unstructured` is only needed by `rag.ipynb` (`UnstructuredURLLoader`). Several lines also have trailing spaces.
 5. ~~**Missing `.gitignore`**~~ — fixed in round 2.
-6. **Deprecated FastAPI hook:** `@app.on_event("startup")` is deprecated in favour of lifespan handlers.
+6. ~~**Deprecated FastAPI hook:** `@app.on_event("startup")` is deprecated in favour of lifespan handlers.~~ — fixed in round 4 (`backend/main.py` uses `lifespan`).
 7. ~~**Loose prompt**~~ — the prompt now says "Answer only from the supplied context … do not invent market data".
 
 ## Round 3: git sync with GitHub
@@ -55,4 +55,27 @@ Deliberately kept:
 - `.gitignore` merged from both versions (adds `.venv/`, `node_modules/`, `.next/`, `*.log`, plus GitHub's `venv/`, `*.pyo`, `faiss_index/`, OS files).
 - `faiss_index/` is now untracked and ignored, matching GitHub. The files stay on disk, so the app still loads them; a fresh clone starts with no collection.
 - Removed the stale root-level `index.faiss`/`index.pkl` that existed only on GitHub (the app never read them).
-8. ~~**Other leftover artifacts**~~ — the deck files now live in `Presentation/`, `frontend/` is gone, and the logs were removed in round 2.
+8. ~~**Other leftover artifacts**~~ — the deck files now live in `Presentation/`, the old `frontend/` folder is gone (a new one was created in round 4), and the logs were removed in round 2.
+
+## Round 4: folder refactor
+
+Split the mixed root into one folder per concern. Tracked files were moved with `git mv`, so their history is kept.
+
+| Before | After |
+|---|---|
+| `app.py` | `backend/` package: `main.py` (FastAPI app, routes, lifespan), `rag.py` (index + LangGraph), `schemas.py` (Pydantic models), `config.py` (settings), `__init__.py` |
+| `requirements.txt` | `backend/requirements.txt` |
+| `faiss_index/` (untracked) | `backend/faiss_index/` (still git-ignored) |
+| `app/`, `package.json`, `package-lock.json`, `tsconfig.json`, `next-env.d.ts` | `frontend/` |
+| `node_modules/` (untracked) | `frontend/node_modules/` |
+| `arch.md`, `postcleanup.md` | `docs/` |
+| `rag.ipynb` | `notebooks/rag.ipynb` |
+
+Behaviour changes (none user-visible):
+- Run the API with `uvicorn backend.main:app --reload --port 8000` from the repo root, and the dashboard with `npm run dev` inside `frontend/`.
+- `INDEX_PATH` is now anchored to `backend/config.py` rather than the working directory.
+- The retriever is private to `backend/rag.py` (`_retriever`) and is accessed through `is_ready()`, `load_saved_index()`, `build_index()` and `answer()`.
+- `@app.on_event("startup")` was replaced by a `lifespan` handler (issue 6).
+- The README's truncated architecture block was repaired.
+
+Also deleted the regenerable `.next/` and root `__pycache__/` caches. `.gitignore` needed no change, because its patterns are unanchored and still match inside the subfolders. `Presentation/generate_deck.py` slide text still mentions `app.py`; this was left as is, because the deck describes the project at the time it was written.

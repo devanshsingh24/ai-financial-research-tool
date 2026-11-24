@@ -13,14 +13,14 @@ flowchart LR
     User([User in browser])
 
     subgraph FE["Next.js dev server :3000"]
-        Page["app/page.tsx<br/>Dashboard (client component)"]
-        Layout["app/layout.tsx + globals.css"]
+        Page["frontend/app/page.tsx<br/>Dashboard (client component)"]
+        Layout["frontend/app/layout.tsx + globals.css"]
     end
 
-    subgraph BE["FastAPI / Uvicorn :8000  (app.py)"]
-        API["Endpoints<br/>/health · /api/process · /api/query"]
-        Graph["LangGraph<br/>retrieve → generate"]
-        Ret[("retriever<br/>(module global)")]
+    subgraph BE["FastAPI / Uvicorn :8000  (backend/)"]
+        API["main.py endpoints<br/>/health · /api/process · /api/query"]
+        Graph["rag.py LangGraph<br/>retrieve → generate"]
+        Ret[("_retriever<br/>(rag.py module state)")]
     end
 
     subgraph OL["Ollama :11434"]
@@ -28,7 +28,7 @@ flowchart LR
         LLM["llama3<br/>(generation)"]
     end
 
-    Disk[("faiss_index/<br/>index.faiss + index.pkl")]
+    Disk[("backend/faiss_index/<br/>index.faiss + index.pkl")]
     Web[(Public news sites)]
 
     User --> Page
@@ -45,10 +45,11 @@ flowchart LR
 
 | Layer | Technology | Lives in | Role |
 |---|---|---|---|
-| UI | Next.js 15 (App Router), React 19, TypeScript | `app/` | Collects URLs and questions, shows answers and sources |
-| API | FastAPI + Uvicorn, Pydantic | `app.py` | Validates requests, runs ingestion and the RAG graph |
-| Orchestration | LangChain, LangGraph | `app.py` | Loader, splitter, prompt, `retrieve → generate` state machine |
-| Vector store | FAISS (`faiss-cpu`) | memory + `faiss_index/` | Similarity search over chunk embeddings |
+| UI | Next.js 15 (App Router), React 19, TypeScript | `frontend/app/` | Collects URLs and questions, shows answers and sources |
+| API | FastAPI + Uvicorn, Pydantic | `backend/main.py`, `backend/schemas.py` | Validates requests, calls ingestion and the RAG graph |
+| Orchestration | LangChain, LangGraph | `backend/rag.py` | Loader, splitter, prompt, `retrieve → generate` state machine |
+| Settings | Python constants | `backend/config.py` | Model names, chunking, top-k, index path, CORS |
+| Vector store | FAISS (`faiss-cpu`) | memory + `backend/faiss_index/` | Similarity search over chunk embeddings |
 | Models | Ollama (`nomic-embed-text`, `llama3`) | separate Ollama service | Embeddings and answer generation |
 
 ---
@@ -59,32 +60,31 @@ flowchart LR
 sequenceDiagram
     autonumber
     participant U as uvicorn
-    participant A as app.py (module import)
-    participant D as faiss_index/
+    participant A as backend (package import)
+    participant D as backend/faiss_index/
     participant O as Ollama
 
-    U->>A: import app
-    A->>A: create FastAPI app + CORS (allow http://localhost:3000)
-    A->>A: OllamaLLM("llama3", temp 0.2), OllamaEmbeddings("nomic-embed-text")
+    U->>A: import backend.main (pulls in config, schemas, rag)
+    A->>A: rag.py: OllamaLLM("llama3", temp 0.2), OllamaEmbeddings("nomic-embed-text")
     Note over A,O: Only client objects are created. Ollama is not contacted yet.
-    A->>A: build prompt template
-    A->>A: compile LangGraph: retrieve → generate → END
-    U->>A: startup event → load_saved_index()
-    alt faiss_index/ exists
+    A->>A: rag.py: build prompt template, compile LangGraph: retrieve → generate → END
+    A->>A: main.py: create FastAPI app (with lifespan) + CORS (allow http://localhost:3000)
+    U->>A: lifespan startup → rag.load_saved_index()
+    alt backend/faiss_index/ exists
         A->>D: FAISS.load_local(..., allow_dangerous_deserialization=True)
         D-->>A: vectors + docstore
-        A->>A: retriever = store.as_retriever(k=4)
+        A->>A: _retriever = store.as_retriever(k=4)
     else no saved index
-        A->>A: retriever stays None
+        A->>A: _retriever stays None
     end
     U-->>U: listening on :8000
 ```
 
 Key points:
 
-- **Everything is module-level.** `llm`, `embeddings`, `prompt`, `rag_app` (the compiled graph) and `retriever` are created once per process and shared by all requests.
-- **`retriever` is the only mutable state.** It is `None` until an index is loaded or built. Both endpoints read it, and `/api/process` replaces it.
-- **`INDEX_PATH = Path("faiss_index")` is relative**, so Uvicorn must be started from the repo root or the saved index won't be found.
+- **Everything is module-level in `rag.py`.** `llm`, `embeddings`, `prompt`, `rag_app` (the compiled graph) and `_retriever` are created once per process and shared by all requests.
+- **`_retriever` is the only mutable state.** It is `None` until an index is loaded or built. The endpoints reach it only through `rag.is_ready()`, `rag.build_index()` and `rag.answer()`, never by importing it, because `/api/process` replaces it.
+- **`INDEX_PATH` is anchored to `backend/config.py`** (`Path(__file__).resolve().parent / "faiss_index"`), so the saved index is found whatever directory Uvicorn is started from.
 - **`index.pkl` is a pickle**, which is why loading needs `allow_dangerous_deserialization=True`. Only load indexes you created yourself.
 
 ---
@@ -103,7 +103,7 @@ sequenceDiagram
     participant S as Text splitter
     participant O as Ollama (nomic-embed-text)
     participant X as FAISS
-    participant D as faiss_index/
+    participant D as backend/faiss_index/
 
     User->>P: paste 1–3 URLs, click "Create research collection"
     P->>P: trim, drop empty fields; if none → notice, stop
@@ -118,7 +118,7 @@ sequenceDiagram
     O-->>F: one 768-dim vector per chunk
     F->>X: FAISS.from_documents(chunks, embeddings)
     X->>D: save_local → index.faiss + index.pkl (overwrites)
-    F->>F: retriever = store.as_retriever(k=4)  (replaces old one)
+    F->>F: rag._retriever = store.as_retriever(k=4)  (replaces old one)
     F-->>P: 200 {message, indexed_documents, sources}
     P-->>User: "N research passages indexed from M sources."
 ```
@@ -132,10 +132,10 @@ sequenceDiagram
 | Splitting | `RecursiveCharacterTextSplitter` tries separators in order `"\n\n"`, `"\n"`, `"."`, `","` and keeps chunks ≤ 1000 characters. | 200-character overlap keeps sentences that cross a boundary retrievable. Each chunk inherits its page's `source`. |
 | Embedding | `OllamaEmbeddings` sends chunk text to Ollama's embedding API; `nomic-embed-text` returns a vector per chunk. | Runs on your CPU/GPU via Ollama; this is usually the slowest step. |
 | Indexing | `FAISS.from_documents` stores vectors in a flat (exact, brute-force) L2 index, and chunk text + metadata in an in-memory docstore keyed by ID. | Flat search is exact and fine for the few hundred chunks a handful of articles produce. |
-| Persisting | `save_local("faiss_index")` writes `index.faiss` (the vectors) and `index.pkl` (docstore + ID mapping). | **Overwrites** the previous collection. There is no append. |
-| Activation | The global `retriever` is swapped to the new store with `k=4`. | Takes effect for the very next query. |
+| Persisting | `save_local(INDEX_PATH)` (`backend/faiss_index/`) writes `index.faiss` (the vectors) and `index.pkl` (docstore + ID mapping). | **Overwrites** the previous collection. There is no append. |
+| Activation | `rag._retriever` is swapped to the new store with `k=4`. | Takes effect for the very next query. |
 
-Any exception in this handler (network failure, empty page, Ollama down) is returned as **422** `"Could not process URLs: …"`, and the old index stays in place on disk unless saving had already happened.
+All of the above runs inside `rag.build_index(urls)`; the handler in `main.py` only converts the URLs to strings and wraps errors. Any exception (network failure, empty page, Ollama down) is returned as **422** `"Could not process URLs: …"`, and the old index stays in place on disk unless saving had already happened.
 
 ---
 
@@ -157,10 +157,10 @@ sequenceDiagram
     User->>P: type question, submit
     P->>F: POST /api/query {"question": "..."}
     F->>F: Pydantic: 3–1500 chars (else 422)
-    alt retriever is None
+    alt not rag.is_ready()
         F-->>P: 409 "Add and process at least one source first."
     else index ready
-        F->>G: invoke({question, documents: [], sources: [], answer: ""})
+        F->>G: rag.answer(question) → invoke({question, documents: [], sources: [], answer: ""})
         G->>R: retrieve node: retriever.invoke(question)
         R->>O1: embed question
         O1-->>R: query vector
@@ -197,7 +197,7 @@ class RAGState(TypedDict):
 
 Each node receives the full state and returns a new full state (`{**state, ...}`).
 
-- **`retrieve`** raises if `retriever` is `None` (a second guard behind the endpoint's 409 check), then runs the similarity search.
+- **`retrieve`** raises if `_retriever` is `None` (a second guard behind the endpoint's 409 check), then runs the similarity search.
 - **`generate`** builds the chain `prompt | llm | StrOutputParser()`, fills `{context}` with the four chunks separated by blank lines, and stores the plain-text answer. `dict.fromkeys(...)` removes duplicate URLs while keeping their order, because several of the top chunks often come from the same article.
 
 The graph is linear today, but because it's a LangGraph `StateGraph`, adding steps (query rewriting, re-ranking, a "no answer" branch, tool calls) means adding nodes and edges rather than rewriting the endpoint.
@@ -221,7 +221,7 @@ The model only sees these four chunks, never the full articles, so answer qualit
 
 ---
 
-## 5. Frontend internals (`app/`)
+## 5. Frontend internals (`frontend/app/`)
 
 ```mermaid
 flowchart TD
@@ -260,7 +260,7 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-    subgraph faiss_index/
+    subgraph IDX["backend/faiss_index/"]
         IF["index.faiss<br/>FAISS flat L2 index<br/>N × 768 float32 vectors"]
         IP["index.pkl (pickle)<br/>• InMemoryDocstore: id → Document(text, {source})<br/>• index_to_docstore_id: row → id"]
     end
@@ -290,12 +290,12 @@ FAISS itself only stores numbers. LangChain keeps the mapping from each vector r
 ## 8. Design trade-offs and limits
 
 - **Single collection.** Each `/api/process` call replaces the index; there are no collections per user or topic.
-- **Single-user assumption.** FastAPI runs these sync handlers in a thread pool, and the global `retriever` is swapped without a lock. Fine for one local user, not for a shared server.
+- **Single-user assumption.** FastAPI runs these sync handlers in a thread pool, and `rag._retriever` is swapped without a lock. Fine for one local user, not for a shared server.
 - **Blocking generation.** The answer is returned in one piece once `llama3` finishes; there's no streaming.
 - **Exact search.** Flat L2 search is accurate and fast at this scale; a large corpus would need an approximate FAISS index (IVF/HNSW).
-- **Fixed retrieval.** `k=4`, 1000-character chunks and temperature 0.2 are hard-coded in `app.py`.
+- **Fixed retrieval.** `k=4`, 1000-character chunks and temperature 0.2 are constants in `backend/config.py` (no env-var or per-request overrides).
 - **Prompt-only grounding.** The prompt tells the model to answer only from the context and not invent market data, but nothing enforces it; `llama3` can still add outside knowledge when retrieved chunks are off-topic.
-- **Local-only index.** `faiss_index/` is git-ignored, so a fresh clone starts with no collection until URLs are processed.
+- **Local-only index.** `backend/faiss_index/` is git-ignored, so a fresh clone starts with no collection until URLs are processed.
 
 ---
 
@@ -303,9 +303,9 @@ FAISS itself only stores numbers. LangChain keeps the mapping from each vector r
 
 | Path | Purpose |
 |---|---|
-| `rag.ipynb` | Original prototype of the same pipeline in a notebook. Uses `UnstructuredURLLoader` and `llama3` at temperature 0.9. Not imported by the app. |
+| `notebooks/rag.ipynb` | Original prototype of the same pipeline in a notebook. Uses `UnstructuredURLLoader` and `llama3` at temperature 0.9, and writes its own `notebooks/faiss_index/`. Not imported by the app. |
 | `Presentation/` | College deck (`FinSight_College_Presentation.pptx`), the script that generates it (`generate_deck.py`) and an image. |
-| `postcleanup.md` | Record of removed files and known issues. |
+| `docs/postcleanup.md` | Record of removed/moved files and known issues. |
 | `CLAUDE.md` | Guidance for Claude Code working in this repo. |
 
 ---
@@ -314,11 +314,11 @@ FAISS itself only stores numbers. LangChain keeps the mapping from each vector r
 
 ```mermaid
 flowchart TD
-    A["ollama serve<br/>(models pulled)"] --> B["uvicorn app:app --port 8000"]
-    B --> C{"faiss_index/ exists?"}
+    A["ollama serve<br/>(models pulled)"] --> B["uvicorn backend.main:app --port 8000"]
+    B --> C{"backend/faiss_index/ exists?"}
     C -- yes --> D["retriever loaded<br/>/health: collection_ready = true"]
     C -- no --> E["retriever = None<br/>/health: collection_ready = false"]
-    F["npm run dev → localhost:3000"] --> G["User pastes URLs"]
+    F["frontend/: npm run dev → localhost:3000"] --> G["User pastes URLs"]
     E --> G
     D --> H
     G --> I["/api/process<br/>fetch → split → embed → index → save"]
