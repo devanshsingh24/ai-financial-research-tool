@@ -17,12 +17,13 @@ import re
 import sqlite3
 import uuid
 from datetime import date
-from typing import Any, Dict, List, Optional, TypedDict
+from typing import Any, Dict, Iterator, List, Optional, Tuple, TypedDict
 
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_ollama import OllamaLLM
 from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.config import get_stream_writer
 from langgraph.graph import END, StateGraph
 from langgraph.types import Command, interrupt
 
@@ -152,18 +153,91 @@ def _today() -> str:
     return date.today().isoformat()
 
 
+def _writer():
+    """LangGraph's custom stream writer; a no-op outside a graph run (e.g. unit tests)."""
+    try:
+        return get_stream_writer()
+    except RuntimeError:
+        return lambda _chunk: None
+
+
+class _AnswerFieldStreamer:
+    """Incrementally extract the "answer" string value from streamed JSON text.
+
+    feed(chunk) returns the newly decoded characters of the answer (possibly "").
+    Handles escapes (\\n, \\", \\\\, \\uXXXX) split across chunks. Best effort only:
+    the authoritative draft is always taken from the fully parsed JSON afterwards.
+    """
+
+    _START = re.compile(r'"answer"\s*:\s*"')
+    _SIMPLE = {'"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
+
+    def __init__(self) -> None:
+        self._raw = ""
+        self._pos = -1  # index in _raw where the answer string's content begins; -1 = not found yet
+        self._done = False
+
+    def feed(self, chunk: str) -> str:
+        if self._done:
+            return ""
+        self._raw += chunk
+        if self._pos < 0:
+            match = self._START.search(self._raw)
+            if not match:
+                return ""
+            self._pos = match.end()
+        out = []
+        i, raw = self._pos, self._raw
+        while i < len(raw):
+            ch = raw[i]
+            if ch == '"':
+                self._done = True
+                i += 1
+                break
+            if ch == "\\":
+                if i + 1 >= len(raw):
+                    break  # escape split across chunks: wait for more
+                esc = raw[i + 1]
+                if esc == "u":
+                    if i + 6 > len(raw):
+                        break
+                    try:
+                        out.append(chr(int(raw[i + 2:i + 6], 16)))
+                    except ValueError:
+                        pass
+                    i += 6
+                    continue
+                out.append(self._SIMPLE.get(esc, esc))
+                i += 2
+                continue
+            out.append(ch)
+            i += 1
+        self._pos = i
+        return "".join(out)
+
+
 # ---------------------------------------------------------------- nodes
 
 
 def retrieve_scored(state: ResearchState) -> ResearchState:
     documents, sources, best = rag.search_with_scores(state["question"])
+    _writer()({"type": "sources", "sources": list(dict.fromkeys(sources))})
     return {"documents": documents, "sources": sources, "best_distance": best, "searches_used": 0}
 
 
 def draft(state: ResearchState) -> ResearchState:
-    raw = (draft_prompt | json_llm | StrOutputParser()).invoke(
+    # Stream the "answer" field to the client as it is generated; decide afterwards.
+    writer = _writer()
+    extractor = _AnswerFieldStreamer()
+    pieces: List[str] = []
+    for chunk in (draft_prompt | json_llm | StrOutputParser()).stream(
         {"today": _today(), "context": "\n\n".join(state["documents"]), "question": state["question"]}
-    )
+    ):
+        pieces.append(chunk)
+        text = extractor.feed(chunk)
+        if text:
+            writer({"type": "token", "text": text})
+    raw = "".join(pieces)
     parsed = _parse_json(raw)
     if parsed is None:
         log.warning("Draft was not valid JSON; treating as can_answer=false")
@@ -209,6 +283,8 @@ def plan_search(state: ResearchState) -> ResearchState:
     query = str(parsed.get("query") or "").strip() or state["question"]
     topic = parsed.get("topic") if parsed.get("topic") in TOPICS else "general"
     time_range = parsed.get("time_range") if parsed.get("time_range") in TIME_RANGES else None
+    when = f" · past {time_range}" if time_range else ""
+    _writer()({"type": "status", "text": f"Searching the web: “{query}” · {topic}{when}"})
     return {"search": {"query": query, "topic": topic, "time_range": time_range}}
 
 
@@ -241,6 +317,7 @@ def web_search(state: ResearchState) -> ResearchState:
     if cached is not None:
         log.info("Tavily cache HIT (0 credits): %r topic=%s time_range=%s",
                  s["query"], s["topic"], s["time_range"])
+        _writer()({"type": "status", "text": f"Using cached web results ({len(cached)}) · 0 credits"})
         return {"web_results": cached, "from_cache": True, "search_error": None, "searches_used": 1}
     try:
         results = _tavily(s["query"], s["topic"], s["time_range"])
@@ -250,6 +327,8 @@ def web_search(state: ResearchState) -> ResearchState:
         log.warning("Tavily search failed (not retried): %s", exc)
         return {"web_results": [], "from_cache": False, "search_error": str(exc)[:300], "searches_used": 1}
     web_cache.put(s["query"], s["topic"], s["time_range"], results)
+    if results:
+        _writer()({"type": "status", "text": f"Reading {len(results)} web results…"})
     return {"web_results": results, "from_cache": False,
             "search_error": None if results else "No web results found.", "searches_used": 1}
 
@@ -264,10 +343,16 @@ def final_answer(state: ResearchState) -> ResearchState:
     web = "\n\n".join(
         f"[{i}] {r['title']}\nURL: {r['url']}\n{r['content']}" for i, r in enumerate(results, 1)
     )
-    answer = (final_prompt | rag.llm | StrOutputParser()).invoke(
+    writer = _writer()
+    pieces: List[str] = []
+    for piece in (final_prompt | rag.llm | StrOutputParser()).stream(
         {"today": _today(), "web": web, "context": "\n\n".join(state["documents"]),
          "question": state["question"]}
-    )
+    ):
+        if piece:
+            pieces.append(piece)
+            writer({"type": "token", "text": piece})
+    answer = "".join(pieces)
     sources_list = "\n".join(f"[{i}] {r['url']}" for i, r in enumerate(results, 1))
     return {"answer": f"{answer.strip()}\n\nSources:\n{sources_list}",
             "citations": list(dict.fromkeys([r["url"] for r in results] + local_sources))}
@@ -343,11 +428,51 @@ def ask(question: str) -> Dict[str, Any]:
     return _response(thread_id, result)
 
 
-def confirm(thread_id: str, approve: bool) -> Dict[str, Any]:
+def _check_awaiting(thread_id: str) -> None:
     snapshot = research_app.get_state(_config(thread_id))
     if not snapshot.values:
         raise ThreadNotFound(thread_id)
     if "ask_permission" not in (snapshot.next or ()):
         raise NotAwaitingConfirmation(thread_id)
+
+
+def confirm(thread_id: str, approve: bool) -> Dict[str, Any]:
+    _check_awaiting(thread_id)
     result = research_app.invoke(Command(resume=approve), _config(thread_id))
     return _response(thread_id, result)
+
+
+# ---------------------------------------------------------------- streaming API helpers
+# Events: ("sources", [urls]), ("token", text), ("status", text), then exactly one of
+# ("needs_confirmation", {...}) or ("answered", {...}) — same payloads as /ask and /confirm.
+
+
+def _stream(graph_input: Any, thread_id: str) -> Iterator[Tuple[str, Any]]:
+    config = _config(thread_id)
+    for mode, chunk in research_app.stream(graph_input, config, stream_mode=["custom", "updates"]):
+        if mode == "custom":
+            kind = chunk.get("type")
+            if kind == "token":
+                yield "token", chunk["text"]
+            elif kind == "sources":
+                yield "sources", chunk["sources"]
+            elif kind == "status":
+                yield "status", chunk["text"]
+        elif mode == "updates" and "__interrupt__" in chunk:
+            payload = _response(thread_id, {"__interrupt__": chunk["__interrupt__"]})
+            yield "needs_confirmation", payload
+            return
+    yield "answered", _response(thread_id, research_app.get_state(config).values)
+
+
+def stream_ask(question: str) -> Iterator[Tuple[str, Any]]:
+    yield from _stream({"question": question}, uuid.uuid4().hex)
+
+
+def check_confirmable(thread_id: str) -> None:
+    """Raise ThreadNotFound / NotAwaitingConfirmation before a stream starts."""
+    _check_awaiting(thread_id)
+
+
+def stream_confirm(thread_id: str, approve: bool) -> Iterator[Tuple[str, Any]]:
+    yield from _stream(Command(resume=approve), thread_id)

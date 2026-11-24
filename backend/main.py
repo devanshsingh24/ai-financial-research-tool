@@ -120,8 +120,44 @@ def query_stream(payload: QueryRequest) -> StreamingResponse:
         except Exception as exc:
             yield _sse("error", {"detail": f"Could not generate research: {exc}"})
 
-    return StreamingResponse(
-        events(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    return _sse_response(events())
+
+
+_SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+
+
+def _sse_response(events: Iterator[str]) -> StreamingResponse:
+    return StreamingResponse(events, media_type="text/event-stream", headers=_SSE_HEADERS)
+
+
+def _research_events(stream: Iterator) -> Iterator[str]:
+    """SSE wrapper for web_research streams: sources/token/status, then
+    needs_confirmation or answered, then done (or error)."""
+    try:
+        for event, data in stream:
+            yield _sse(event, data)
+        yield _sse("done", {})
+    except Exception as exc:
+        yield _sse("error", {"detail": f"Could not answer: {exc}"})
+
+
+@app.post("/ask/stream")
+def ask_stream(payload: QueryRequest) -> StreamingResponse:
+    """Streaming /ask: tokens of the local draft/answer arrive live."""
+    if not rag.is_ready():
+        raise HTTPException(status_code=409, detail="Add and process at least one source first.")
+    return _sse_response(_research_events(web_research.stream_ask(payload.question)))
+
+
+@app.post("/confirm/stream")
+def confirm_stream(payload: ConfirmRequest) -> StreamingResponse:
+    """Streaming /confirm: search status, then the final answer's tokens arrive live."""
+    try:
+        web_research.check_confirmable(payload.thread_id)
+    except web_research.ThreadNotFound:
+        raise HTTPException(status_code=404, detail="Unknown thread_id.")
+    except web_research.NotAwaitingConfirmation:
+        raise HTTPException(status_code=409, detail="This question is not waiting for confirmation.")
+    return _sse_response(
+        _research_events(web_research.stream_confirm(payload.thread_id, payload.approve))
     )

@@ -268,6 +268,13 @@ flowchart LR
 - **Deciding `can_answer`:** the LLM's JSON value, forced to `false` if the best FAISS distance is above `MAX_DISTANCE` (0.75), the question asks for recent or real-time info, or the draft admits it can't answer. If the JSON can't be parsed, the draft is treated as not answerable.
 - **Credit safety:** there is no edge back to the search, `searches_used` is checked, failed searches aren't retried, and successful results are cached by (query, topic, time_range). The logs show `cache HIT (0 credits)` or `credit USED (1 credit)`.
 - **Failures:** if Tavily fails (bad key, network, no results), the answer is the draft plus "Web search failed (…); answer not verified".
+- **Streaming** (`/ask/stream`, `/confirm/stream`, used by the dashboard): the same graph runs with `research_app.stream(stream_mode=["custom", "updates"])`. Nodes push events through LangGraph's stream writer:
+  - `retrieve_scored` sends `sources`.
+  - `draft` sends `token`s; the `"answer"` field is pulled out of the JSON as it streams.
+  - `plan_search` and `web_search` send `status` ("Searching the web: …", "Using cached web results", "Reading 5 web results…").
+  - `final_answer` sends `token`s.
+
+  The stream ends with `needs_confirmation` (from the interrupt) or `answered`, then `done`. The writer does nothing under `invoke`, so the JSON endpoints behave as before.
 
 ---
 

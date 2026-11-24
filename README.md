@@ -56,10 +56,12 @@ Open `http://localhost:3000`.
 
 The **Web fallback** switch sits at the top right of the Research terminal and is on by default.
 
-- **On:** FinSight first answers from your sources (0 credits, tagged **YOUR SOURCES**). If they can't answer, for example on today's price or recent news, a card shows the **draft** with two buttons:
-  - **Search the web**: runs one Tavily search (1 credit, or 0 if cached). The answer is tagged **WEB · 1 CREDIT**, shows the search query, and lists numbered sources `[1]…[5]` that match the citations in the text.
-  - **No, use draft**: no search. The draft is shown and tagged **UNVERIFIED**.
-- **Off:** answers stream live from your sources only. No web search is offered.
+Answers stream in live, word by word, in **both** modes.
+
+- **On:** the answer from your sources streams in (0 credits, tagged **YOUR SOURCES**). If your sources can't answer, for example on today's price or recent news, the streamed text is tagged **DRAFT · NOT VERIFIED** and two buttons appear under it:
+  - **Search the web**: runs one Tavily search (1 credit, or 0 if cached). The status line shows the search (for example *Searching the web: "Nvidia stock price today" · finance · past day*), then the verified answer streams in. It is tagged **WEB · 1 CREDIT**, with numbered sources `[1]…[5]` that match the citations.
+  - **No, use draft**: no search. The draft stays, tagged **UNVERIFIED**.
+- **Off:** answers stream from your sources only. No web search is offered.
 
 Web search needs `TAVILY_API_KEY` in `.env` (see Setup).
 
@@ -85,6 +87,7 @@ See [docs/arch.md](docs/arch.md) for the detailed architecture.
 | `POST /api/query/stream` | Same, streamed as Server-Sent Events: `sources`, many `token`s, then `done` (or `error`). Used by the dashboard. |
 | `POST /ask` | `{question}` → `{status: "answered", answer, sources}` or `{status: "needs_confirmation", thread_id, prompt, draft}` |
 | `POST /confirm` | `{thread_id, approve}` → resumes a paused `/ask`: approve runs one web search, decline returns the draft marked "not verified" |
+| `POST /ask/stream`, `POST /confirm/stream` | Streaming versions used by the dashboard (SSE): `sources`, `status`, many `token`s, then `needs_confirmation` or `answered` (same payload as the JSON endpoints), then `done` |
 
 Example (PowerShell):
 

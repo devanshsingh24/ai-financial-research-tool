@@ -19,9 +19,8 @@
 .web-toggle input:disabled+.track{opacity:.5}
 .toggle-text{font:500 10px 'DM Mono';letter-spacing:.1em;display:flex;flex-direction:column;gap:3px}
 .toggle-text small{font:10px 'DM Mono';letter-spacing:0;color:var(--muted)}
-.confirm-card{margin-top:28px;border:1px solid var(--ink);background:var(--paper);padding:18px 18px 16px;font-size:15px;line-height:1.65}
-.answer-text.draft{color:#3c4b48;margin:0 0 16px}
-.confirm-row{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;flex-wrap:wrap;border-top:1px dashed var(--line);padding-top:14px}
+.answer-text.draft{color:#3c4b48}
+.confirm-row{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;flex-wrap:wrap;margin:4px 0 18px;border:1px solid var(--ink);background:var(--paper);padding:14px 16px}
 .confirm-row p{margin:0;font-weight:600;font-size:14px;display:flex;flex-direction:column;gap:2px}
 .confirm-row small{font:400 11px 'DM Mono';color:var(--muted)}
 .confirm-actions{display:flex;gap:8px;flex-wrap:wrap}
