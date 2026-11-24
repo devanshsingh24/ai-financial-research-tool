@@ -219,6 +219,39 @@ Answer:
 
 The model only sees these four chunks, never the full articles, so answer quality depends heavily on retrieval. Errors in the graph (for example Ollama not running) return **500** `"Could not generate research: …"`.
 
+### 4.4 Streaming variant (`POST /api/query/stream`), used by the dashboard
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant P as page.tsx
+    participant F as main.py
+    participant R as rag.stream_answer
+    participant O as Ollama llama3
+
+    P->>F: POST /api/query/stream {"question": "..."}
+    alt not rag.is_ready()
+        F-->>P: 409 JSON (before any streaming)
+    else
+        F-->>P: 200 text/event-stream (headers sent)
+        F->>R: iterate
+        R->>R: retrieve node (top-4 chunks)
+        R-->>P: event: sources  data: [urls]
+        R->>O: chain.stream(prompt)
+        loop each generated piece
+            O-->>R: text piece
+            R-->>P: event: token  data: "piece"
+        end
+        F-->>P: event: done  data: {}
+    end
+```
+
+- Each event is `event: <name>\ndata: <json>\n\n`. JSON-encoding the data keeps newlines inside tokens from breaking the framing.
+- The status is already 200 once streaming starts, so a failure mid-stream (for example Ollama stopping) is sent as `event: error` with `{"detail": "Could not generate research: …"}`.
+- `stream_answer` reuses the `retrieve` node and the shared `chain` (`prompt | llm | StrOutputParser()`) but doesn't run the compiled graph, because it needs `chain.stream` rather than `invoke`. Any node added to the graph later must also be added here if it should apply to streamed answers.
+- The handler is a sync generator, so Starlette runs it in a thread pool and the event loop stays free.
+- `/api/query` (non-streaming JSON) is kept for scripts and other clients.
+
 ---
 
 ## 5. Frontend internals (`frontend/app/`)
@@ -232,7 +265,7 @@ flowchart TD
     subgraph Page["page.tsx — Dashboard ('use client')"]
         State["useState:<br/>urls[3] · question · isIndexing · isResearching · notice · result"]
         Ingest["ingestSources()<br/>POST /api/process"]
-        Ask["askResearch()<br/>POST /api/query"]
+        Ask["askResearch()<br/>POST /api/query/stream (reads SSE)"]
         UI1["Research collection form<br/>3 URL inputs"]
         UI2["Research terminal<br/>textarea + notice + answer"]
     end
@@ -250,7 +283,8 @@ flowchart TD
 - **UI state:**
   - `isIndexing` / `isResearching` disable the buttons and change their labels during requests.
   - `notice` is a single status line used for progress, success and error messages; on failure it shows the backend's `detail`.
-  - `result` holds the last answer. Sources render as links labelled by hostname (`new URL(source).hostname`, `www.` removed).
+  - `isStreaming` shows a blinking `.cursor` after the answer text while tokens are arriving.
+  - `result` holds the current answer. It starts empty, sources fill in on the `sources` event, and each `token` event is appended. The answer paragraph uses `white-space: pre-wrap`, so the model's line breaks show. Sources render as links labelled by hostname (`new URL(source).hostname`, `www.` removed).
 - **Static sections** (hero, "On the horizon" roadmap cards, footer) are presentational only.
 - The UI shows three URL fields, while the API accepts up to ten.
 
@@ -291,7 +325,7 @@ FAISS itself only stores numbers. LangChain keeps the mapping from each vector r
 
 - **Single collection.** Each `/api/process` call replaces the index; there are no collections per user or topic.
 - **Single-user assumption.** FastAPI runs these sync handlers in a thread pool, and `rag._retriever` is swapped without a lock. Fine for one local user, not for a shared server.
-- **Blocking generation.** The answer is returned in one piece once `llama3` finishes; there's no streaming.
+- **Streaming, but not cancellable.** The dashboard streams tokens as `llama3` writes them, but there is no stop button. Closing the page doesn't necessarily stop generation on the server right away.
 - **Exact search.** Flat L2 search is accurate and fast at this scale; a large corpus would need an approximate FAISS index (IVF/HNSW).
 - **Fixed retrieval.** `k=4`, 1000-character chunks and temperature 0.2 are constants in `backend/config.py` (no env-var or per-request overrides).
 - **Prompt-only grounding.** The prompt tells the model to answer only from the context and not invent market data, but nothing enforces it; `llama3` can still add outside knowledge when retrieved chunks are off-topic.

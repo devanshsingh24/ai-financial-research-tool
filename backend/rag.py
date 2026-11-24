@@ -4,7 +4,7 @@ The active retriever is module-private state. Use the functions below rather tha
 importing it directly, because `/api/process` replaces it at runtime.
 """
 
-from typing import List, Optional, Tuple, TypedDict
+from typing import Iterator, List, Optional, Tuple, TypedDict
 
 from langchain_community.document_loaders import WebBaseLoader
 from langchain_community.vectorstores import FAISS
@@ -48,6 +48,11 @@ Question: {question}
 
 Answer:"""
 )
+chain = prompt | llm | StrOutputParser()
+
+
+def _context(documents: List[str]) -> str:
+    return "\n\n".join(documents)
 
 
 def is_ready() -> bool:
@@ -94,8 +99,8 @@ def retrieve(state: RAGState) -> RAGState:
 
 
 def generate(state: RAGState) -> RAGState:
-    answer = (prompt | llm | StrOutputParser()).invoke(
-        {"context": "\n\n".join(state["documents"]), "question": state["question"]}
+    answer = chain.invoke(
+        {"context": _context(state["documents"]), "question": state["question"]}
     )
     return {**state, "answer": answer, "sources": list(dict.fromkeys(state["sources"]))}
 
@@ -113,3 +118,15 @@ def answer(question: str) -> Tuple[str, List[str]]:
     """Run the graph and return (answer, deduplicated source URLs)."""
     result = rag_app.invoke({"question": question, "documents": [], "sources": [], "answer": ""})
     return result["answer"], result["sources"]
+
+
+def stream_answer(question: str) -> Iterator[Tuple[str, object]]:
+    """Stream the answer as ("sources", [urls]) once, then ("token", text) pieces.
+
+    Uses the same retrieve node and chain as the graph, but streams the LLM output.
+    """
+    state = retrieve({"question": question, "documents": [], "sources": [], "answer": ""})
+    yield "sources", list(dict.fromkeys(state["sources"]))
+    for piece in chain.stream({"context": _context(state["documents"]), "question": question}):
+        if piece:
+            yield "token", piece

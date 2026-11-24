@@ -10,6 +10,7 @@ Local RAG-based financial research with a Next.js dashboard, FastAPI, LangGraph,
 - Text is split into overlapping chunks, embedded with Ollama `nomic-embed-text` and indexed in FAISS.
 - The index is saved to `backend/faiss_index/` and reloaded automatically when the API restarts.
 - Questions are answered by a local Ollama `llama3` model via a LangGraph `retrieve → generate` workflow, with the source URLs listed under the answer.
+- Answers stream in live, word by word with a typing cursor, like a chat app. The source links appear as soon as retrieval finishes, before the answer starts.
 
 ## Setup
 
@@ -53,11 +54,11 @@ Open `http://localhost:3000`.
 ```
 Next.js dashboard (frontend/app/page.tsx, :3000)
         │  POST /api/process  {urls}
-        │  POST /api/query    {question}
+        │  POST /api/query/stream {question}  → streamed events
         ▼
 FastAPI (backend/main.py, :8000)
   process: WebBaseLoader → text splitter → nomic-embed-text → FAISS (saved to backend/faiss_index/)
-  query:   LangGraph retrieve (top 4 chunks) → generate (llama3) → answer + source URLs
+  query:   retrieve (top 4 chunks) → sources event → llama3 tokens streamed → done
 ```
 
 See [docs/arch.md](docs/arch.md) for the detailed architecture.
@@ -66,7 +67,8 @@ See [docs/arch.md](docs/arch.md) for the detailed architecture.
 |---|---|
 | `GET /health` | Status and whether an index is loaded |
 | `POST /api/process` | Fetch, chunk, embed and index URLs |
-| `POST /api/query` | Answer a question from the indexed sources |
+| `POST /api/query` | Answer a question from the indexed sources (whole answer as JSON) |
+| `POST /api/query/stream` | Same, streamed as Server-Sent Events: `sources`, many `token`s, then `done` (or `error`). Used by the dashboard. |
 
 ## Project layout
 
