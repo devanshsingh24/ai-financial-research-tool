@@ -11,9 +11,26 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-from . import rag
+import logging
+
+from . import rag, web_research
 from .config import CORS_ORIGINS
-from .schemas import ProcessRequest, ProcessResponse, QueryRequest, QueryResponse
+from .schemas import (
+    AskResponse,
+    ConfirmRequest,
+    ProcessRequest,
+    ProcessResponse,
+    QueryRequest,
+    QueryResponse,
+)
+
+# Show web-search cache hits / credit usage in the uvicorn console.
+_web_log = logging.getLogger("finsight.web")
+if not _web_log.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(levelname)s:     [web] %(message)s"))
+    _web_log.addHandler(_handler)
+    _web_log.setLevel(logging.INFO)
 
 
 @asynccontextmanager
@@ -58,6 +75,30 @@ def query(payload: QueryRequest) -> QueryResponse:
         return QueryResponse(answer=answer, sources=sources)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Could not generate research: {exc}") from exc
+
+
+@app.post("/ask", response_model=AskResponse)
+def ask(payload: QueryRequest) -> AskResponse:
+    """Answer from FAISS; if the local answer isn't reliable, ask before a web search."""
+    if not rag.is_ready():
+        raise HTTPException(status_code=409, detail="Add and process at least one source first.")
+    try:
+        return AskResponse(**web_research.ask(payload.question))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not answer: {exc}") from exc
+
+
+@app.post("/confirm", response_model=AskResponse)
+def confirm(payload: ConfirmRequest) -> AskResponse:
+    """Resume a paused /ask: approve=true runs ONE web search, false returns the draft."""
+    try:
+        return AskResponse(**web_research.confirm(payload.thread_id, payload.approve))
+    except web_research.ThreadNotFound:
+        raise HTTPException(status_code=404, detail="Unknown thread_id.")
+    except web_research.NotAwaitingConfirmation:
+        raise HTTPException(status_code=409, detail="This question is not waiting for confirmation.")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not answer: {exc}") from exc
 
 
 def _sse(event: str, data: object) -> str:

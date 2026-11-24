@@ -37,6 +37,7 @@ class RAGState(TypedDict):
 llm = OllamaLLM(model=LLM_MODEL, temperature=LLM_TEMPERATURE)
 embeddings = OllamaEmbeddings(model=EMBED_MODEL)
 _retriever: Optional[VectorStoreRetriever] = None
+_store: Optional[FAISS] = None  # same index as _retriever; used for scored search
 
 prompt = ChatPromptTemplate.from_template(
     """You are a precise financial research assistant. Answer only from the supplied context. If the context does not support an answer, say so clearly. Keep the answer concise and do not invent market data.
@@ -61,11 +62,12 @@ def is_ready() -> bool:
 
 def load_saved_index() -> None:
     """Make a previously-created local collection available after a server restart."""
-    global _retriever
+    global _retriever, _store
     if INDEX_PATH.exists():
         store = FAISS.load_local(
             str(INDEX_PATH), embeddings, allow_dangerous_deserialization=True
         )
+        _store = store
         _retriever = store.as_retriever(search_kwargs={"k": TOP_K})
 
 
@@ -74,7 +76,7 @@ def build_index(urls: List[str]) -> int:
 
     Returns the number of chunks indexed.
     """
-    global _retriever
+    global _retriever, _store
     documents = WebBaseLoader(web_paths=tuple(urls)).load()
     if not documents:
         raise ValueError("No readable content was found at the supplied URLs.")
@@ -83,8 +85,23 @@ def build_index(urls: List[str]) -> int:
     ).split_documents(documents)
     store = FAISS.from_documents(chunks, embeddings)
     store.save_local(str(INDEX_PATH))
+    _store = store
     _retriever = store.as_retriever(search_kwargs={"k": TOP_K})
     return len(chunks)
+
+
+def search_with_scores(question: str) -> Tuple[List[str], List[str], float]:
+    """Top-k chunks with L2 distances (lower = closer).
+
+    Returns (chunk texts, source URLs, best distance). Best distance is inf if empty.
+    """
+    if _store is None:
+        raise ValueError("No research collection has been indexed yet.")
+    hits = _store.similarity_search_with_score(question, k=TOP_K)
+    texts = [doc.page_content for doc, _ in hits]
+    sources = [doc.metadata.get("source", "Unknown source") for doc, _ in hits]
+    best = min((float(score) for _, score in hits), default=float("inf"))
+    return texts, sources, best
 
 
 def retrieve(state: RAGState) -> RAGState:

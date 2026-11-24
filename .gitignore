@@ -22,3 +22,9 @@ faiss_index/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Secrets (Tavily API key)
+.env
+
+# Web-search cache and LangGraph checkpoints
+backend/data/

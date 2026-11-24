@@ -10,5 +10,8 @@ tiktoken
 pandas
 numpy
 langgraph
+langgraph-checkpoint-sqlite
+langchain-tavily
+python-dotenv
 fastapi
 uvicorn[standard]

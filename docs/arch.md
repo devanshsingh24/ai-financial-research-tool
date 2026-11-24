@@ -252,6 +252,23 @@ sequenceDiagram
 - The handler is a sync generator, so Starlette runs it in a thread pool and the event loop stays free.
 - `/api/query` (non-streaming JSON) is kept for scripts and other clients.
 
+### 4.5 Web-search fallback (`POST /ask` + `POST /confirm`, `backend/web_research.py`)
+
+```mermaid
+flowchart LR
+    R[retrieve_scored<br/>FAISS top-4 + L2 distance] --> D[draft<br/>llama3 JSON: can_answer, answer]
+    D -- "can_answer" --> E1([END: answered, 0 credits])
+    D -- "not answerable" --> A[ask_permission<br/>interrupt: Search the web? 1 credit]
+    A -- "approve=false" --> U[unverified<br/>draft + not-verified note] --> E2([END])
+    A -- "approve=true" --> P[plan_search<br/>query, topic, time_range] --> W[web_search<br/>cache or ONE Tavily call] --> F[final_answer<br/>cites URLs] --> E3([END])
+```
+
+- **`/ask`** runs the graph under a new `thread_id`. If the graph stops at `interrupt()`, the response is `needs_confirmation` with the draft. The paused state lives in the SQLite checkpointer (`backend/data/checkpoints.sqlite`).
+- **`/confirm`** resumes that thread with `Command(resume=approve)`. It returns 404 for an unknown thread and 409 if the thread isn't paused, so a thread can be confirmed only once.
+- **Deciding `can_answer`:** the LLM's JSON value, forced to `false` if the best FAISS distance is above `MAX_DISTANCE` (0.75), the question asks for recent or real-time info, or the draft admits it can't answer. If the JSON can't be parsed, the draft is treated as not answerable.
+- **Credit safety:** there is no edge back to the search, `searches_used` is checked, failed searches aren't retried, and successful results are cached by (query, topic, time_range). The logs show `cache HIT (0 credits)` or `credit USED (1 credit)`.
+- **Failures:** if Tavily fails (bad key, network, no results), the answer is the draft plus "Web search failed (…); answer not verified".
+
 ---
 
 ## 5. Frontend internals (`frontend/app/`)

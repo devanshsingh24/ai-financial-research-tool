@@ -14,7 +14,7 @@ Prerequisite: Ollama running locally with `llama3` and `nomic-embed-text` pulled
 pip install -r backend/requirements.txt
 cd frontend; npm install
 
-uvicorn backend.main:app --reload --port 8000   # backend API (run from repo root; `backend` is a package)
+uvicorn backend.main:app --reload --reload-dir backend --port 8000   # backend API (run from repo root; `backend` is a package)
 npm run dev                                     # in frontend/: Next.js dashboard at http://localhost:3000
 npm run build                                   # in frontend/: production build / type check
 ```
@@ -33,6 +33,13 @@ Two processes talk over HTTP: a Next.js frontend (`frontend/`) and a FastAPI bac
     - `POST /api/process` calls `build_index`, which runs `WebBaseLoader` → splitter → `FAISS.from_documents` → `save_local`. It **replaces** the whole index; it does not append. Errors return 422.
     - `POST /api/query` calls `answer`, which returns the answer plus deduplicated source URLs. It returns 409 if nothing is indexed and 500 on generation errors.
     - `POST /api/query/stream` (used by the dashboard) calls `rag.stream_answer`, which reuses the `retrieve` node and the shared `chain`, but calls `chain.stream` instead of going through the graph. It returns `text/event-stream` with `event:` + JSON `data:` blocks: `sources` (once, deduped), `token` (repeated), then `done`, or `error` with `{detail}` if something fails mid-stream. The 409 and 422 errors happen before streaming starts, so they are normal JSON responses. If you change the prompt or retrieval, both paths pick it up; graph-only nodes would not apply to the stream.
+- **`backend/web_research.py`** is a second, separate LangGraph (`research_app`) behind `POST /ask` and `POST /confirm`. It is API-only; the dashboard doesn't use it yet.
+  - Flow: `retrieve_scored` → `draft` (JSON-mode `llama3`: `{can_answer, answer}`) → END if answerable. Otherwise `ask_permission` (`interrupt()`) → `unverified` (draft + "not verified" note), or `plan_search` → `web_search` → `final_answer`.
+  - **At most one Tavily search per question.** There is no edge back into `plan_search` or `web_search`, `web_search` refuses if `searches_used >= 1`, failures are not retried, and `/confirm` returns 409 unless the thread is paused at `ask_permission`. Keep all of this if you edit the graph.
+  - `can_answer` is forced to false in three cases: the best FAISS L2 distance is above `MAX_DISTANCE` (0.75, calibrated in `config.py`); the question contains recency words (`_RECENCY`); or the draft hedges (`_HEDGING`). The guards exist because llama3 often claims it can answer when it can't. They can only force false, never true.
+  - The checkpointer is `SqliteSaver` at `backend/data/checkpoints.sqlite`, with one `thread_id` per question. The Tavily cache (`web_cache.py`) is `backend/data/tavily_cache.sqlite`, keyed by sha256(query lower/stripped, topic, time_range). The `finsight.web` logger prints `cache HIT (0 credits)` or `credit USED (1 credit)`.
+  - `TAVILY_API_KEY` comes from `<repo root>/.env` (git-ignored; template in `.env.example`). It is loaded by `config.py` and re-read before each search. The Tavily client is created lazily, so the server runs without a key.
+  - `rag.search_with_scores` uses the module-level `_store`, which `load_saved_index` and `build_index` set alongside `_retriever`.
 - **`frontend/`** is the Next.js 15 App Router app (React 19, TypeScript). The entire UI is one client component in `frontend/app/page.tsx`. It reads the answer stream with `fetch` + `ReadableStream` (`EventSource` can't POST), parses the events with `parseEvent`, and shows a blinking `.cursor` while `isStreaming`. It calls the API at `NEXT_PUBLIC_API_URL`, defaulting to `http://localhost:8000`, and surfaces the backend's `detail` message on errors.
 - **`backend/faiss_index/`** (`index.faiss` + `index.pkl`) is git-ignored (a fresh clone has no collection) and is rewritten on every "process URLs" call. It is loaded with `allow_dangerous_deserialization=True`, so only load indexes you created.
 - **`docs/`** holds `arch.md` (detailed architecture with Mermaid diagrams) and `postcleanup.md`.
@@ -44,3 +51,5 @@ Two processes talk over HTTP: a Next.js frontend (`frontend/`) and a FastAPI bac
 - `backend/requirements.txt` includes packages neither the backend nor the notebook imports (`sentence-transformers`, `pandas`, `numpy`, `tiktoken`).
 - `docs/postcleanup.md` records files removed or moved and known issues not yet fixed; update it when cleaning up further.
 - If you change backend behaviour or file layout, keep `README.md` and `docs/arch.md` in sync.
+- Use `--reload-dir backend` with uvicorn. Without it, WatchFiles also watches `.venv/` and `frontend/node_modules/`, and reloads on Windows can hang (the old worker keeps serving old code).
+- Each `/confirm approve=true` can spend a real Tavily credit. Test the search path offline by monkeypatching `web_research._tavily`.

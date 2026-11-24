@@ -11,6 +11,7 @@ Local RAG-based financial research with a Next.js dashboard, FastAPI, LangGraph,
 - The index is saved to `backend/faiss_index/` and reloaded automatically when the API restarts.
 - Questions are answered by a local Ollama `llama3` model via a LangGraph `retrieve → generate` workflow, with the source URLs listed under the answer.
 - Answers stream in live, word by word with a typing cursor, like a chat app. The source links appear as soon as retrieval finishes, before the answer starts.
+- **Web-search fallback (API).** `/ask` answers from your sources for free. If the answer needs fresh data or the sources don't cover it, the request pauses and asks *"Search the web? (1 credit)"*. `/confirm` then runs **one** Tavily search and returns an answer citing the web URLs, or returns the local draft marked as unverified. Results are cached, so repeating a search costs 0 credits.
 
 ## Setup
 
@@ -28,13 +29,15 @@ pip install -r backend/requirements.txt
 cd frontend; npm install; cd ..
 ```
 
-3. Start the research API from the repo root:
+3. Optional, for web search: copy `.env.example` to `.env` and add your [Tavily](https://tavily.com) key (`TAVILY_API_KEY=...`). `.env` is git-ignored.
+
+4. Start the research API from the repo root:
 
 ```powershell
 uvicorn backend.main:app --reload --port 8000
 ```
 
-4. Start the Next.js dashboard in a second terminal:
+5. Start the Next.js dashboard in a second terminal:
 
 ```powershell
 cd frontend
@@ -69,6 +72,16 @@ See [docs/arch.md](docs/arch.md) for the detailed architecture.
 | `POST /api/process` | Fetch, chunk, embed and index URLs |
 | `POST /api/query` | Answer a question from the indexed sources (whole answer as JSON) |
 | `POST /api/query/stream` | Same, streamed as Server-Sent Events: `sources`, many `token`s, then `done` (or `error`). Used by the dashboard. |
+| `POST /ask` | `{question}` → `{status: "answered", answer, sources}` or `{status: "needs_confirmation", thread_id, prompt, draft}` |
+| `POST /confirm` | `{thread_id, approve}` → resumes a paused `/ask`: approve runs one web search, decline returns the draft marked "not verified" |
+
+Example (PowerShell):
+
+```powershell
+$r = Invoke-RestMethod -Method Post http://localhost:8000/ask -ContentType application/json -Body '{"question":"What is Nvidia''s stock price today?"}'
+$r.status   # needs_confirmation
+Invoke-RestMethod -Method Post http://localhost:8000/confirm -ContentType application/json -Body (@{thread_id=$r.thread_id; approve=$true} | ConvertTo-Json)
+```
 
 ## Project layout
 
@@ -77,7 +90,10 @@ See [docs/arch.md](docs/arch.md) for the detailed architecture.
 | `backend/main.py` | FastAPI app, CORS, startup and routes |
 | `backend/rag.py` | Indexing and the LangGraph `retrieve → generate` pipeline |
 | `backend/schemas.py` | Pydantic request/response models |
-| `backend/config.py` | Models, chunking, top-k, index path and CORS settings |
+| `backend/config.py` | Models, chunking, top-k, index path, CORS and web-search settings; loads `.env` |
+| `backend/web_research.py` | Web-search fallback graph (draft → confirm → one Tavily search), SQLite checkpointer |
+| `backend/web_cache.py` | SQLite cache of Tavily results |
+| `backend/data/` | Tavily cache + LangGraph checkpoints (git-ignored) |
 | `backend/requirements.txt` | Python dependencies |
 | `backend/faiss_index/` | Saved FAISS index (git-ignored) |
 | `frontend/` | Next.js dashboard (single page in `frontend/app/`) |
