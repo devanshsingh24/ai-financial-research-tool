@@ -1,0 +1,31 @@
+# Production: docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+# (do NOT combine with docker-compose.override.yml)
+# - no database port published: reach it through `docker compose exec db psql` or an SSH tunnel
+# - no reload, several uvicorn workers, always restart
+services:
+  db:
+    restart: always
+    ports: !reset []
+    deploy:
+      resources:
+        limits: { cpus: "2.0", memory: 2g }
+
+  migrate:
+    restart: "no"
+
+  api:
+    restart: always
+    environment:
+      UVICORN_RELOAD: "0"
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-2}
+      # Behind a reverse proxy (nginx, Caddy, a load balancer) on the Docker network.
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-*}
+    volumes: !override
+      - app_data:/data
+      - faiss_index:/data/faiss_index
+    deploy:
+      resources:
+        limits: { cpus: "${API_CPUS:-2.0}", memory: "${API_MEMORY:-3g}" }
+
+  cleanup:
+    restart: always

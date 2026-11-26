@@ -1,0 +1,11 @@
+# Local development: the API's runtime dependencies plus tests and the notebook prototype.
+#   pip install -r requirements-dev.txt -c backend/constraints.txt
+-r backend/requirements.txt
+# tests (pytest -q from the repo root)
+pytest
+httpx
+# notebooks/rag.ipynb only (UnstructuredURLLoader and friends); not used by the API
+unstructured
+tiktoken
+pandas
+numpy

@@ -1,20 +1,30 @@
 """Local API for the FinSight Next.js dashboard.
 
-Run from the repo root with: uvicorn backend.main:app --reload --port 8000
+Run from the repo root with: uvicorn backend.main:app --reload --reload-dir backend --port 8000
 """
 
-import json
-from contextlib import asynccontextmanager
-from typing import Iterator
-
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-
+import asyncio
 import logging
+from contextlib import AsyncExitStack, asynccontextmanager
+from typing import Iterator, Optional
 
-from . import rag, web_research
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
+from sqlalchemy import text
+
+from . import config, db, housekeeping, idempotency, llm as models, persistence, rag, threads, web_research
+from .api_threads import (
+    claim,
+    current_user,
+    require_confirmable,
+    require_index,
+    router as threads_router,
+    run_json,
+    run_sse,
+)
 from .config import CORS_ORIGINS
+from .idempotency import key_header
 from .schemas import (
     AskResponse,
     ConfirmRequest,
@@ -23,23 +33,50 @@ from .schemas import (
     QueryRequest,
     QueryResponse,
 )
+from .sse import sse, sse_response
 
-# Show web-search cache hits / credit usage in the uvicorn console.
-_web_log = logging.getLogger("finsight.web")
-if not _web_log.handlers:
-    _handler = logging.StreamHandler()
-    _handler.setFormatter(logging.Formatter("%(levelname)s:     [web] %(message)s"))
-    _web_log.addHandler(_handler)
-    _web_log.setLevel(logging.INFO)
+# Show web-search cache hits / credit usage (and memory/persistence notes) in the uvicorn console.
+for _name in ("finsight.web", "finsight.rag", "finsight.memory", "finsight.persistence", "finsight.housekeeping",
+              "finsight.threads"):
+    _log = logging.getLogger(_name)
+    if not _log.handlers:
+        _handler = logging.StreamHandler()
+        _handler.setFormatter(logging.Formatter("%(levelname)s:     [%(name)s] %(message)s"))
+        _log.addHandler(_handler)
+        _log.setLevel(logging.INFO)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    logging.getLogger("finsight.rag").info(
+        "Models: %s · embeddings %s · data %s", models.describe(), models.embedding_id()["model"],
+        config.DATA_DIR)
     rag.load_saved_index()
-    yield
+    async with AsyncExitStack() as stack:
+        await persistence.open_runtime(stack)
+        await threads.open_registry()
+        stack.push_async_callback(threads.close_registry)
+        if config.FAIL_RUNNING_ON_START:  # Docker does this once in backend/prestart.py instead
+            failed = await threads.fail_running()
+            if failed:
+                logging.getLogger("finsight.persistence").info(
+                    "%d thread(s) were interrupted by the last shutdown; /threads/{id}/retry resumes them",
+                    failed)
+        cleanup = None
+        if config.CLEANUP_INTERVAL_HOURS > 0:
+            cleanup = asyncio.create_task(housekeeping.run_forever())
+        try:
+            yield
+        finally:
+            if cleanup is not None:
+                cleanup.cancel()
+                try:
+                    await cleanup
+                except asyncio.CancelledError:
+                    pass
 
 
-app = FastAPI(title="FinSight Research API", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="FinSight Research API", version="1.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -47,11 +84,46 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(threads_router)
+
+
+async def _check_db() -> str:
+    """'ok', or why the database can't be used (checks the registry and the saver pool)."""
+    try:
+        runtime = persistence.runtime()
+    except RuntimeError as exc:
+        return f"error: {exc}"
+    try:
+        async def registry_ping() -> None:
+            async with threads.engine().connect() as conn:
+                await conn.execute(text("SELECT 1"))
+
+        await asyncio.wait_for(registry_ping(), 2.0)
+        if runtime.pool is not None:
+            await db.ping(runtime.pool, 2.0)
+        return "ok"
+    except Exception as exc:
+        return f"error: {db.error_text(exc) or 'timeout'}"
 
 
 @app.get("/health")
-def health() -> dict:
-    return {"status": "ok", "collection_ready": rag.is_ready()}
+async def health() -> JSONResponse:
+    """200 when the app is up and its database answers; 503 otherwise (Docker HEALTHCHECK).
+    No collection yet is still healthy: collection_ready says whether one is loaded."""
+    try:
+        backend = persistence.runtime().backend
+    except RuntimeError:
+        backend = None
+    db_status = await _check_db()
+    healthy = db_status == "ok"
+    return JSONResponse(status_code=200 if healthy else 503, content={
+        "status": "ok" if healthy else "degraded",
+        "db": db_status,
+        "collection_ready": rag.is_ready(),
+        "index_problem": rag.index_problem,
+        "persistence": backend,
+        "llm": models.describe(),
+    })
 
 
 @app.post("/api/process", response_model=ProcessResponse)
@@ -77,35 +149,6 @@ def query(payload: QueryRequest) -> QueryResponse:
         raise HTTPException(status_code=500, detail=f"Could not generate research: {exc}") from exc
 
 
-@app.post("/ask", response_model=AskResponse)
-def ask(payload: QueryRequest) -> AskResponse:
-    """Answer from FAISS; if the local answer isn't reliable, ask before a web search."""
-    if not rag.is_ready():
-        raise HTTPException(status_code=409, detail="Add and process at least one source first.")
-    try:
-        return AskResponse(**web_research.ask(payload.question))
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Could not answer: {exc}") from exc
-
-
-@app.post("/confirm", response_model=AskResponse)
-def confirm(payload: ConfirmRequest) -> AskResponse:
-    """Resume a paused /ask: approve=true runs ONE web search, false returns the draft."""
-    try:
-        return AskResponse(**web_research.confirm(payload.thread_id, payload.approve))
-    except web_research.ThreadNotFound:
-        raise HTTPException(status_code=404, detail="Unknown thread_id.")
-    except web_research.NotAwaitingConfirmation:
-        raise HTTPException(status_code=409, detail="This question is not waiting for confirmation.")
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Could not answer: {exc}") from exc
-
-
-def _sse(event: str, data: object) -> str:
-    # JSON-encoding the data keeps newlines inside tokens from breaking the event framing.
-    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
-
-
 @app.post("/api/query/stream")
 def query_stream(payload: QueryRequest) -> StreamingResponse:
     """Stream the answer as Server-Sent Events: sources, token..., then done (or error)."""
@@ -115,49 +158,72 @@ def query_stream(payload: QueryRequest) -> StreamingResponse:
     def events() -> Iterator[str]:
         try:
             for event, data in rag.stream_answer(payload.question):
-                yield _sse(event, data)
-            yield _sse("done", {})
+                yield sse(event, data)
+            yield sse("done", {})
         except Exception as exc:
-            yield _sse("error", {"detail": f"Could not generate research: {exc}"})
+            yield sse("error", {"detail": f"Could not generate research: {exc}"})
 
-    return _sse_response(events())
-
-
-_SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    return sse_response(events())
 
 
-def _sse_response(events: Iterator[str]) -> StreamingResponse:
-    return StreamingResponse(events, media_type="text/event-stream", headers=_SSE_HEADERS)
+# ---------------------------------------------------------------- web-fallback (one question = one new thread)
 
 
-def _research_events(stream: Iterator) -> Iterator[str]:
-    """SSE wrapper for web_research streams: sources/token/status, then
-    needs_confirmation or answered, then done (or error)."""
-    try:
-        for event, data in stream:
-            yield _sse(event, data)
-        yield _sse("done", {})
-    except Exception as exc:
-        yield _sse("error", {"detail": f"Could not answer: {exc}"})
+async def _new_question_thread(question: str, user_id: str) -> str:
+    thread_id = web_research.new_thread_id()
+    await threads.create(thread_id, user_id, question)
+    return thread_id
+
+
+async def _owned_or_404(thread_id: str, user_id: str) -> None:
+    if await threads.get_owned(thread_id, user_id) is None:
+        raise HTTPException(status_code=404, detail="Unknown thread_id.")
+
+
+@app.post("/ask", response_model=AskResponse)
+async def ask(payload: QueryRequest, request: Request, user_id: str = Depends(current_user),
+              key: Optional[str] = Depends(key_header)):
+    """Answer from FAISS; if the local answer isn't reliable, ask before a web search."""
+    async def run() -> AskResponse:
+        require_index()
+        thread_id = await _new_question_thread(payload.question, user_id)
+        await claim(thread_id, ("idle",))
+        events = web_research.stream_run(web_research.turn_input(payload.question), thread_id, user_id)
+        return await run_json(events, thread_id)
+    return await idempotency.run_once(key, user_id, request, payload, run)
+
+
+@app.post("/confirm", response_model=AskResponse)
+async def confirm(payload: ConfirmRequest, request: Request, user_id: str = Depends(current_user),
+                  key: Optional[str] = Depends(key_header)):
+    """Resume a paused /ask: approve=true continues (search / keep report), false rejects."""
+    async def run() -> AskResponse:
+        await _owned_or_404(payload.thread_id, user_id)
+        await require_confirmable(payload.thread_id, user_id)
+        await claim(payload.thread_id)
+        events = web_research.stream_run(web_research.resume_input(payload.approve),
+                                         payload.thread_id, user_id)
+        return await run_json(events, payload.thread_id)
+    return await idempotency.run_once(key, user_id, request, payload, run)
 
 
 @app.post("/ask/stream")
-def ask_stream(payload: QueryRequest) -> StreamingResponse:
+async def ask_stream(payload: QueryRequest, user_id: str = Depends(current_user)) -> StreamingResponse:
     """Streaming /ask: tokens of the local draft/answer arrive live."""
-    if not rag.is_ready():
-        raise HTTPException(status_code=409, detail="Add and process at least one source first.")
-    return _sse_response(_research_events(web_research.stream_ask(payload.question)))
+    require_index()
+    thread_id = await _new_question_thread(payload.question, user_id)
+    await claim(thread_id, ("idle",))
+    events = web_research.stream_run(web_research.turn_input(payload.question), thread_id, user_id)
+    return run_sse(events, thread_id)
 
 
 @app.post("/confirm/stream")
-def confirm_stream(payload: ConfirmRequest) -> StreamingResponse:
+async def confirm_stream(payload: ConfirmRequest,
+                         user_id: str = Depends(current_user)) -> StreamingResponse:
     """Streaming /confirm: search status, then the final answer's tokens arrive live."""
-    try:
-        web_research.check_confirmable(payload.thread_id)
-    except web_research.ThreadNotFound:
-        raise HTTPException(status_code=404, detail="Unknown thread_id.")
-    except web_research.NotAwaitingConfirmation:
-        raise HTTPException(status_code=409, detail="This question is not waiting for confirmation.")
-    return _sse_response(
-        _research_events(web_research.stream_confirm(payload.thread_id, payload.approve))
-    )
+    await _owned_or_404(payload.thread_id, user_id)
+    await require_confirmable(payload.thread_id, user_id)
+    await claim(payload.thread_id)
+    events = web_research.stream_run(web_research.resume_input(payload.approve),
+                                     payload.thread_id, user_id)
+    return run_sse(events, payload.thread_id)

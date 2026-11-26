@@ -50,7 +50,7 @@ flowchart LR
 | Orchestration | LangChain, LangGraph | `backend/rag.py` | Loader, splitter, prompt, `retrieve → generate` state machine |
 | Settings | Python constants | `backend/config.py` | Model names, chunking, top-k, index path, CORS |
 | Vector store | FAISS (`faiss-cpu`) | memory + `backend/faiss_index/` | Similarity search over chunk embeddings |
-| Models | Ollama (`nomic-embed-text`, `llama3`) | separate Ollama service | Embeddings and answer generation |
+| Models | Ollama (`nomic-embed-text`, `llama3`) by default, or Groq (text) + Hugging Face `bge-small-en-v1.5` (embeddings) with `LLM_PROVIDER=groq` | Ollama service, or Groq API + local `sentence-transformers`; built in `backend/llm.py` | Embeddings and answer generation (see §4.7) |
 
 ---
 
@@ -65,7 +65,7 @@ sequenceDiagram
     participant O as Ollama
 
     U->>A: import backend.main (pulls in config, schemas, rag)
-    A->>A: rag.py: OllamaLLM("llama3", temp 0.2), OllamaEmbeddings("nomic-embed-text")
+    A->>A: rag.py: llm.make_llm() / make_embeddings() → OllamaLLM("llama3", temp 0.2), OllamaEmbeddings("nomic-embed-text") (or ChatGroq + HuggingFaceEmbeddings)
     Note over A,O: Only client objects are created. Ollama is not contacted yet.
     A->>A: rag.py: build prompt template, compile LangGraph: retrieve → generate → END
     A->>A: main.py: create FastAPI app (with lifespan) + CORS (allow http://localhost:3000)
@@ -252,29 +252,81 @@ sequenceDiagram
 - The handler is a sync generator, so Starlette runs it in a thread pool and the event loop stays free.
 - `/api/query` (non-streaming JSON) is kept for scripts and other clients.
 
-### 4.5 Web-search fallback (`POST /ask` + `POST /confirm`, `backend/web_research.py`)
+### 4.5 Web-search fallback, threads and gates (`backend/web_research.py`)
 
 ```mermaid
 flowchart LR
-    R[retrieve_scored<br/>FAISS top-4 + L2 distance] --> D[draft<br/>llama3 JSON: can_answer, answer]
-    D -- "can_answer" --> E1([END: answered, 0 credits])
-    D -- "not answerable" --> A[ask_permission<br/>interrupt: Search the web? 1 credit]
-    A -- "approve=false" --> U[unverified<br/>draft + not-verified note] --> E2([END])
-    A -- "approve=true" --> P[plan_search<br/>query, topic, time_range] --> W[web_search<br/>cache or ONE Tavily call] --> F[final_answer<br/>cites URLs] --> E3([END])
+    S[start_turn<br/>reset per-turn fields,<br/>summarize old turns] --> M[load_memories<br/>store search, first turn only] --> R[retrieve_scored<br/>FAISS top-4 + L2 distance] --> D[draft<br/>llama3 JSON: can_answer, answer]
+    D -- "can_answer" --> FI[finish<br/>append AIMessage]
+    D -- "not answerable" --> P[plan_search<br/>query, topic, time_range]
+    P --> A[ask_permission<br/>interrupt: search gate]
+    A -- "reject" --> U[unverified<br/>draft + not-verified note] --> FI
+    A -- "approve / edit query" --> W[web_search<br/>cache or ONE Tavily call] --> F[final_answer<br/>cites URLs] --> RR[review_report<br/>interrupt: report gate]
+    RR -- "approve / edit / reject" --> FI
+    FI --> SM[save_memory<br/>preferences, companies, report summary] --> E([END])
 ```
 
-- **`/ask`** runs the graph under a new `thread_id`. If the graph stops at `interrupt()`, the response is `needs_confirmation` with the draft. The paused state lives in the SQLite checkpointer (`backend/data/checkpoints.sqlite`).
-- **`/confirm`** resumes that thread with `Command(resume=approve)`. It returns 404 for an unknown thread and 409 if the thread isn't paused, so a thread can be confirmed only once.
-- **Deciding `can_answer`:** the LLM's JSON value, forced to `false` if the best FAISS distance is above `MAX_DISTANCE` (0.75), the question asks for recent or real-time info, or the draft admits it can't answer. If the JSON can't be parsed, the draft is treated as not answerable.
+- **One run = one turn.** The input is `{question, messages: [HumanMessage]}`. `messages` uses the `add_messages` reducer and persists across turns. `start_turn` clears the per-turn fields. Once `messages` exceeds `MAX_MESSAGES`, it summarizes the older ones into `summary` and removes them, keeping the last `KEEP_MESSAGES`. `draft_prompt` and `final_prompt` receive `{history}` (summary plus recent turns) and `{memories}`.
+- **Gates.** Both gates use `interrupt()`. The payload has `kind: "web_search"` (with `draft` and the planned `search`) or `kind: "report"` (with `answer` and `sources`). Resume values go through `_decision`, which accepts the legacy bool from `/confirm` or `{action: approve|reject|edit, query?, draft?}`.
+  - At the search gate, `edit` replaces `search.query` and implies approval.
+  - At the report gate, `edit` replaces `answer`, and `reject` returns the unverified draft.
+  - `plan_search` runs before the search gate so the query can be shown and edited. Planning costs no credits.
+- **Deciding `can_answer`:** the LLM's JSON value, forced to `false` in three cases: the best FAISS distance is above `MAX_DISTANCE` (0.75), the question asks for recent or real-time info, or the draft admits it can't answer. If the JSON can't be parsed, the draft is treated as not answerable.
 - **Credit safety:** there is no edge back to the search, `searches_used` is checked, failed searches aren't retried, and successful results are cached by (query, topic, time_range). The logs show `cache HIT (0 credits)` or `credit USED (1 credit)`.
 - **Failures:** if Tavily fails (bad key, network, no results), the answer is the draft plus "Web search failed (…); answer not verified".
-- **Streaming** (`/ask/stream`, `/confirm/stream`, used by the dashboard): the same graph runs with `research_app.stream(stream_mode=["custom", "updates"])`. Nodes push events through LangGraph's stream writer:
+- **Streaming:** every run goes through `stream_run`, which calls `app.astream(…, stream_mode=["custom", "updates"], durability="sync")`. Nodes push events through LangGraph's stream writer:
   - `retrieve_scored` sends `sources`.
   - `draft` sends `token`s; the `"answer"` field is pulled out of the JSON as it streams.
-  - `plan_search` and `web_search` send `status` ("Searching the web: …", "Using cached web results", "Reading 5 web results…").
+  - `web_search` sends `status` events ("Searching the web: …", "Using cached web results", "Reading 5 web results…").
   - `final_answer` sends `token`s.
 
-  The stream ends with `needs_confirmation` (from the interrupt) or `answered`, then `done`. The writer does nothing under `invoke`, so the JSON endpoints behave as before.
+  After the stream, the thread head is read. A pending interrupt becomes `needs_confirmation`; otherwise the final state becomes `answered`. The JSON endpoints use the same generator (`run`).
+
+### 4.6 Persistence, threads and memory
+
+```mermaid
+flowchart LR
+    API["FastAPI routes<br/>(X-User-Id)"] --> REG[("thread registry<br/>threads table<br/>app.sqlite / Postgres")]
+    API --> G["compiled graph<br/>persistence.runtime().app"]
+    G --> CP[("checkpointer<br/>AsyncSqliteSaver / AsyncPostgresSaver<br/>checkpoints.sqlite")]
+    G --> ST[("store, ns = (user_id, 'memories')<br/>AsyncSqliteStore + sqlite-vec / AsyncPostgresStore + pgvector<br/>memory.sqlite")]
+    HK["housekeeping.purge<br/>(every CLEANUP_INTERVAL_HOURS)"] --> CP
+    HK --> REG
+```
+
+- **Choosing the backend.** `DATABASE_URL` is unset in dev, which means SQLite files in `backend/data/`. A `postgresql://…` URL switches the checkpointer, the store and the registry to Postgres. Everything is async (`astream`/`aget_state`), because `AsyncPostgresSaver` requires it. All of it is opened in the FastAPI `lifespan` and closed on shutdown, so no connection or client lives in graph state.
+- **Durability.** Every run passes `durability="sync"`, so each superstep is written before the next one starts.
+  - **Interrupts and restarts.** A paused thread survives a restart and is resumed with `Command(resume=…)`.
+  - **Failed nodes.** When a node raises, the thread is marked `failed`. `POST /threads/{id}/retry` runs `astream(None, config)`, which re-runs only the unfinished node(s). A completed `web_search` is not paid for again.
+  - **Crashes.** At startup, `threads.fail_running()` marks threads that were still `running` as `failed`, so they can be retried.
+- **Ownership.** `config.configurable` carries `thread_id` and `user_id`. Every `/threads/{id}…` route and the legacy `/confirm` look the thread up in the registry by `(thread_id, user_id)`; a miss returns 404.
+- **Time travel.**
+  - `/history` uses `aget_state_history`.
+  - `/replay` runs `astream(None, config + checkpoint_id)`, which forks from that checkpoint; the new branch becomes the head and old checkpoints are kept.
+  - `/fork` calls `aupdate_state` at a past checkpoint with edited values (any state key except `messages`), then optionally runs the new branch.
+- **Long-term memory.**
+  - `load_memories` runs on the first turn of a thread and searches the user's namespace by the question (`MEMORY_SEARCH_LIMIT`).
+  - `save_memory` runs after every completed turn. One JSON-mode call extracts `{preferences, companies, summary}`, which are upserted under the keys `pref:<hash>`, `company:<slug>` and `report:<thread>:<turn>`, so repeats overwrite rather than duplicate.
+  - Both are best-effort: an error is logged and never fails the answer.
+- **Cleanup.** Threads whose registry `updated_at` is older than `CHECKPOINT_TTL_DAYS` lose their checkpoints and registry row. Orphan checkpoint threads (no registry row, latest checkpoint past the TTL) are deleted too. Memories and the Tavily cache are kept.
+
+### 4.7 Model provider (`backend/llm.py`)
+
+`LLM_PROVIDER` (environment or `.env`) picks the models once, at import:
+
+| | `ollama` (default, local) | `groq` (deployed server) |
+|---|---|---|
+| Text model (`rag.llm`) | `OllamaLLM(llama3)` | `ChatGroq(GROQ_MODEL)`, default `openai/gpt-oss-120b` with `reasoning_effort="low"` (Qwen models get `reasoning_format="hidden"`) |
+| JSON model (`web_research.json_llm`) | `format="json"` | `response_format={"type": "json_object"}` (`GROQ_JSON_MODE=on\|off`; verified with streaming) |
+| Embeddings (`rag.embeddings`, memory index) | `nomic-embed-text` (768) via Ollama | `HuggingFaceEmbeddings(BAAI/bge-small-en-v1.5)` (384, normalized), run locally on CPU with `sentence-transformers`; Groq has no embedding models |
+
+- Every chain is `prompt | model | StrOutputParser()`, so the rest of the code doesn't know which provider runs. The tests patch the same module attributes.
+- **Embeddings must match the index.** `build_index` writes `faiss_index/meta.json` (`{provider, model, dims}`). `load_saved_index` refuses an index built with another embedding model and reports why in `/health` (`index_problem`); create the collection again. An index without `meta.json` counts as Ollama `nomic-embed-text`. Long-term memories are embedded too, so a deployed Groq server should use its own database.
+- **Separate data per provider.** `ollama` uses `backend/faiss_index/` and `backend/data/`; `groq` uses `backend/data/groq/` for the collection (`faiss_index/`), checkpoints, registry, memories and Tavily cache (`config.py`). `EMBED_DIMS` defaults to 768 or 384 to match. Switching locally never overwrites the other provider's collection or mixes memories.
+- `MAX_DISTANCE` (0.75) suits both embedding models. On the Nvidia Wikipedia article, nomic scored 0.37–0.68 on-topic and 1.02–1.20 off-topic; bge-small scored 0.24–0.60 and 0.91–1.12. `retrieve_scored` logs the best distance of every question, for checking another model.
+- `python -m backend.llm` makes one text, one JSON, one streamed JSON and one embedding call with the configured provider, to check the key and models.
+- No LLM gateway (LiteLLM) is used. With two providers, LangChain is enough. A gateway becomes worth it for more providers, per-user budgets and rate limits, or shared key management.
+- `/health` reports `llm` (e.g. `ollama:llama3`), shown in the dashboard nav.
 
 ---
 
@@ -302,7 +354,8 @@ flowchart TD
     State --> UI2
 ```
 
-- **One client component.** All logic is in `Dashboard`; there are no API routes, server actions or shared components. `layout.tsx` only sets metadata and global CSS.
+- **Client components.** The terminal logic is in `Dashboard` (`page.tsx`). The **Research threads** panel is `ThreadsPanel` (`threads.tsx`): it lists the user's threads and shows the open thread's conversation, recalled memories, retry/delete and checkpoint history with replay and fork. Shared fetch/SSE helpers and types are in `api.ts`. There are no API routes or server actions, and `layout.tsx` only sets metadata and global CSS. (The diagram above predates the threads panel.)
+- **Threads in the UI.** With web fallback on, the terminal asks on `activeThread` via `/threads/{id}/messages/stream`. It creates a thread first if none is open, or if the open one is paused at a gate. Gates are answered via `/threads/{id}/resume/stream`. Selecting a thread loads its pending gate or last answer into the terminal. Every request sends `X-User-Id` from the panel's USER field (kept in `localStorage`).
 - **API base URL** is `process.env.NEXT_PUBLIC_API_URL`, defaulting to `http://localhost:8000`. The browser calls FastAPI directly, which is why the backend needs CORS for `localhost:3000`.
 - **UI state:**
   - `isIndexing` / `isResearching` disable the buttons and change their labels during requests.
@@ -329,6 +382,8 @@ flowchart LR
 
 FAISS itself only stores numbers. LangChain keeps the mapping from each vector row to its chunk text and URL in `index.pkl`; both files are needed to answer a query.
 
+**Versions.** Each collection is saved to its own directory `INDEX_PATH/v<time>-<pid>/` (`index.faiss`, `index.pkl`, `meta.json`), and the small file `INDEX_PATH/CURRENT` names the active one. `rag.publish()` writes the new directory first, then replaces `CURRENT` atomically (`os.replace`), and keeps the newest 3. Every request that touches the index (`is_ready`, `search_with_scores`, `retrieve`) reads `CURRENT` and reloads if it changed. So with several uvicorn workers, a collection built by one worker is used by all of them from their next request, and nobody reads a half-written index. A flat index from before versioning (files directly in `INDEX_PATH`) still loads.
+
 ---
 
 ## 7. Error handling and status codes
@@ -339,16 +394,24 @@ FAISS itself only stores numbers. LangChain keeps the mapping from each vector r
 | Page fetch fails, page empty, embedding fails | `/api/process` `except` | 422 | `Could not process URLs: …` |
 | Query before any collection exists | `/api/query` guard | 409 | `Add and process at least one source first.` |
 | Ollama down or generation error | `/api/query` `except` | 500 | `Could not generate research: …` |
+| Unknown thread, or another user's thread | `owned_thread` / `_owned_or_404` | 404 | `Unknown thread_id.` |
+| Resume a thread that isn't paused; new question while paused or running; retry a non-failed thread | threads API guards | 409 | e.g. `This question is not waiting for confirmation.` |
+| A graph node fails mid-run (e.g. Ollama down) | `tracked()` marks the thread `failed` | 500 / SSE `error` | `Could not answer: …` (then `/threads/{id}/retry`) |
+| Two runs on one thread at once (double-clicked resume, two workers) | `threads.claim()` (atomic `UPDATE … WHERE status IN …`) | 409 | `This thread is already running.` |
+| `Idempotency-Key` reused with a different body / while the first is running | `idempotency.run_once` | 422 / 409 | `This Idempotency-Key was already used for a different request.` |
+| Database unreachable at startup | `db.wait_for_db` (prestart, lifespan, migrate) | process exits | `Cannot reach PostgreSQL (host=… db=… user=…) after 30s: …` (password masked) |
+| Schema not migrated | `threads.open_registry` | process exits | `Run the migrations first: docker compose run --rm migrate` |
 | API not running | browser `fetch` throws | — | `Could not reach the research API.` |
 
-`GET /health` returns `{"status": "ok", "collection_ready": <bool>}` for a quick check.
+`GET /health` returns `{"status": "ok"|"degraded", "db": "ok"|"error: …", "collection_ready": <bool>, "index_problem": <str|null>, "persistence": "sqlite"|"postgres", "llm": "<provider>:<model>"}`. It pings the registry engine and, on Postgres, the LangGraph pool (2 s timeout each): **200** when the database answers, **503** otherwise. The Docker `HEALTHCHECK` uses it. No collection yet is still healthy.
 
 ---
 
 ## 8. Design trade-offs and limits
 
 - **Single collection.** Each `/api/process` call replaces the index; there are no collections per user or topic.
-- **Single-user assumption.** FastAPI runs these sync handlers in a thread pool, and `rag._retriever` is swapped without a lock. Fine for one local user, not for a shared server.
+- **No authentication.** `X-User-Id` is trusted. Threads and memories are scoped per user, but anyone who can reach the API can claim any user ID.
+- **One API replica.** Several uvicorn workers in one container are safe (claims, index versions, advisory-locked cleanup, `fail_running` once per container start). Several API *containers* would also need `fail_running` to know which container owned a run; it currently assumes a container restart means every `running` thread died.
 - **Streaming, but not cancellable.** The dashboard streams tokens as `llama3` writes them, but there is no stop button. Closing the page doesn't necessarily stop generation on the server right away.
 - **Exact search.** Flat L2 search is accurate and fast at this scale; a large corpus would need an approximate FAISS index (IVF/HNSW).
 - **Fixed retrieval.** `k=4`, 1000-character chunks and temperature 0.2 are constants in `backend/config.py` (no env-var or per-request overrides).
@@ -357,7 +420,48 @@ FAISS itself only stores numbers. LangChain keeps the mapping from each vector r
 
 ---
 
-## 9. Supporting pieces (not in the runtime path)
+## 9. Production deployment (Docker + PostgreSQL)
+
+```mermaid
+flowchart LR
+    subgraph compose["docker compose (project finsight)"]
+        DB[("db<br/>pgvector/pgvector:pg16<br/>volume pg_data")]
+        MIG["migrate (one-shot)<br/>alembic upgrade head<br/>+ LangGraph setup()<br/>user: owner"]
+        API["api<br/>prestart → uvicorn ×WEB_CONCURRENCY<br/>user: finsight_app<br/>volumes faiss_index, app_data"]
+        CLEAN["cleanup<br/>housekeeping --loop<br/>user: finsight_app"]
+        OLL["ollama (profile local)"]
+    end
+    DB -- healthy --> MIG
+    MIG -- "exited 0" --> API
+    MIG -- "exited 0" --> CLEAN
+    API --> DB
+    CLEAN --> DB
+    API -. "LLM_PROVIDER=ollama" .-> OLL
+    API -. "LLM_PROVIDER=groq" .-> GROQ["Groq API"]
+    DBV["DBeaver<br/>finsight_readonly"] -. "127.0.0.1:5433 (dev only)" .-> DB
+```
+
+- **Image** (`Dockerfile`): a multi-stage build on `python:3.11-slim`. The builder installs CPU-only torch, then `backend/requirements.txt` pinned by `backend/constraints.txt`, and downloads `BAAI/bge-small-en-v1.5`. The runtime stage copies the venv and model cache, runs as uid 10001, has `HF_HUB_OFFLINE=1`, and a `HEALTHCHECK` on `/health`. No `.env` or secrets are in the build context (`.dockerignore`). The `test` stage adds pytest and `tests/`.
+- **Roles** (`docker/db/init/01-roles.sh`, first init only; re-run with `scripts/db-roles.sh`):
+  - The owner (`POSTGRES_USER`) is used only by `migrate`, backups and restores.
+  - `finsight_app` gets SELECT/INSERT/UPDATE/DELETE through default privileges, and no DDL.
+  - `finsight_readonly` gets SELECT only and `default_transaction_read_only`.
+- **Startup order:** `db` healthy → `migrate` exits 0 → `api` and `cleanup`.
+  - `api` runs `backend/prestart.py` once: wait for the DB, check the schema is at head, `fail_running()`. Then the workers start with `DB_SETUP_ON_START=false` and `FAIL_RUNNING_ON_START=false`.
+  - Each worker opens one psycopg pool (`DB_POOL_MAX`) for the saver and store, plus a small SQLAlchemy pool for the registry.
+- **Overrides:**
+  - `docker-compose.override.yml` (dev, automatic): `./backend` mounted, `--reload` (polling), Postgres on `127.0.0.1:5433`.
+  - `docker-compose.prod.yml`: no DB port, `WEB_CONCURRENCY=2`, `restart: always`, larger limits.
+  - `docker-compose.e2e.yml`: the test stack on port 8100 with the fake-model app.
+- **Operations:**
+  - `scripts/backup.sh` writes a custom-format `pg_dump` to `backups/`, checks it, and keeps 14.
+  - `scripts/restore.sh` stops the writers, recreates the DB, restores, re-grants, migrates, restarts and waits for `/health`.
+  - The `cleanup` service purges every `CLEANUP_INTERVAL_HOURS` under an advisory lock.
+- **Tables:** see [DATABASE.md](DATABASE.md) for every table, DBeaver access and inspection queries.
+
+---
+
+## 10. Supporting pieces (not in the runtime path)
 
 | Path | Purpose |
 |---|---|
@@ -368,7 +472,7 @@ FAISS itself only stores numbers. LangChain keeps the mapping from each vector r
 
 ---
 
-## 10. Run-time lifecycle summary
+## 11. Run-time lifecycle summary
 
 ```mermaid
 flowchart TD

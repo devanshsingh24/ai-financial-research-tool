@@ -28,3 +28,6 @@ Thumbs.db
 
 # Web-search cache and LangGraph checkpoints
 backend/data/
+
+# Database backups (scripts/backup.sh)
+backups/

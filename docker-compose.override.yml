@@ -1,0 +1,15 @@
+# Development overrides, loaded automatically by `docker compose up`.
+# - hot reload: ./backend is mounted into the container and uvicorn runs with --reload
+# - Postgres published on 127.0.0.1:5433 (localhost only) for DBeaver / psql
+services:
+  api:
+    environment:
+      UVICORN_RELOAD: "1"
+      WEB_CONCURRENCY: "1"
+      WATCHFILES_FORCE_POLLING: "true"   # file events don't cross the Windows/macOS bind mount
+    volumes:
+      - ./backend:/app/backend:ro
+
+  db:
+    ports:
+      - "127.0.0.1:${DB_PORT:-5433}:5432"

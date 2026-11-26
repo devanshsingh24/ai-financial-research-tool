@@ -1,0 +1,26 @@
+# Keep the build context small and secret-free: only backend/, alembic.ini, docker/,
+# pytest.ini and tests/ are needed.
+**/.env
+**/.env.*
+!.env.example
+.git
+.gitignore
+.venv
+venv
+**/__pycache__
+**/*.pyc
+.pytest_cache
+frontend
+node_modules
+backend/data
+backend/faiss_index
+backups
+notebooks
+Presentation
+docs
+*.md
+!README.md
+.claude
+.vscode
+.idea
+docker-compose*.yml

@@ -1,0 +1,159 @@
+# FinSight: API + PostgreSQL (+ optional Ollama).
+#   dev : docker compose up --build                (also loads docker-compose.override.yml)
+#   prod: docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+#   local models: add --profile local (Ollama container; set LLM_PROVIDER=ollama in .env)
+#   tests: docker compose --profile test run --rm tests
+# Secrets come from .env (git-ignored; see .env.example). Nothing secret is baked into the image.
+
+name: finsight
+
+x-app-env: &app-env
+  # Least-privilege DB user: read/write rows only. Built from .env; fails fast if unset.
+  # Only the variables listed here reach the containers (no env_file), so the API never
+  # sees the Postgres admin or read-only passwords.
+  DATABASE_URL: postgresql://${APP_DB_USER:-finsight_app}:${APP_DB_PASSWORD:?Set APP_DB_PASSWORD in .env}@db:5432/${POSTGRES_DB:-finsight}
+  LLM_PROVIDER: ${LLM_PROVIDER:-groq}
+  GROQ_API_KEY: ${GROQ_API_KEY:-}
+  GROQ_MODEL: ${GROQ_MODEL:-openai/gpt-oss-120b}
+  TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+  OLLAMA_BASE_URL: http://ollama:11434
+  CHECKPOINT_TTL_DAYS: ${CHECKPOINT_TTL_DAYS:-30}
+  IDEMPOTENCY_TTL_HOURS: ${IDEMPOTENCY_TTL_HOURS:-24}
+  DB_POOL_MAX: ${DB_POOL_MAX:-10}
+  DB_CONNECT_TIMEOUT: ${DB_CONNECT_TIMEOUT:-30}
+  # Schema changes and crash recovery run once, outside the workers (migrate / prestart).
+  DB_SETUP_ON_START: "false"
+  FAIL_RUNNING_ON_START: "false"
+
+x-logging: &logging
+  driver: json-file
+  options: { max-size: "10m", max-file: "5" }
+
+services:
+  db:
+    image: pgvector/pgvector:pg16   # official postgres:16 + the pgvector extension
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-finsight_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-finsight}
+      APP_DB_USER: ${APP_DB_USER:-finsight_app}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:?Set APP_DB_PASSWORD in .env}
+      READONLY_DB_USER: ${READONLY_DB_USER:-finsight_readonly}
+      READONLY_DB_PASSWORD: ${READONLY_DB_PASSWORD:?Set READONLY_DB_PASSWORD in .env}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./docker/db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\" -h 127.0.0.1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    shm_size: 256mb
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 1g }
+    logging: *logging
+
+  migrate:
+    build: { context: ., target: runtime }
+    image: finsight-api:latest
+    command: ["migrate"]
+    restart: "no"
+    environment:
+      # The DB owner runs migrations; the API never gets these credentials.
+      MIGRATION_DATABASE_URL: postgresql://${POSTGRES_USER:-finsight_admin}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-finsight}
+      LLM_PROVIDER: ${LLM_PROVIDER:-groq}
+      DB_CONNECT_TIMEOUT: ${DB_CONNECT_TIMEOUT:-30}
+    depends_on:
+      db: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 512m }
+    logging: *logging
+
+  api:
+    build: { context: ., target: runtime }
+    image: finsight-api:latest
+    command: ["api"]
+    restart: unless-stopped
+    environment:
+      <<: *app-env
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-1}
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - app_data:/data                    # Tavily cache
+      - faiss_index:/data/faiss_index     # research collection (versioned FAISS index)
+    depends_on:
+      db: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status == 200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 90s
+    stop_grace_period: 40s
+    deploy:
+      resources:
+        limits: { cpus: "2.0", memory: 2g }
+    logging: *logging
+
+  cleanup:
+    image: finsight-api:latest
+    command: ["cleanup"]
+    restart: unless-stopped
+    environment:
+      <<: *app-env
+      CLEANUP_INTERVAL_HOURS: ${CLEANUP_INTERVAL_HOURS:-6}
+    depends_on:
+      db: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+    healthcheck:
+      disable: true   # a background loop, not a server
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 512m }
+    logging: *logging
+
+  ollama:
+    image: ollama/ollama:latest
+    profiles: [local]
+    restart: unless-stopped
+    volumes:
+      - ollama_models:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits: { cpus: "4.0", memory: 8g }
+    logging: *logging
+
+  # The test suite against this stack's Postgres (database finsight_test, as the owner).
+  tests:
+    build: { context: ., target: test }
+    image: finsight-api:test
+    profiles: [test]
+    command: ["pytest", "-q", "-p", "no:cacheprovider"]
+    environment:
+      TEST_DATABASE_URL: postgresql://${POSTGRES_USER:-finsight_admin}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/finsight_test
+      LLM_PROVIDER: ollama   # tests patch the models; ollama builds no network client at import
+    depends_on:
+      db: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { cpus: "2.0", memory: 2g }
+
+volumes:
+  pg_data:
+  faiss_index:
+  app_data:
+  ollama_models:

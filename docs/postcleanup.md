@@ -79,3 +79,10 @@ Behaviour changes (none user-visible):
 - The README's truncated architecture block was repaired.
 
 Also deleted the regenerable `.next/` and root `__pycache__/` caches. `.gitignore` needed no change, because its patterns are unanchored and still match inside the subfolders. `Presentation/generate_deck.py` slide text still mentions `app.py`; this was left as is, because the deck describes the project at the time it was written.
+
+## Round 3: requirements split (Docker + PostgreSQL work)
+
+- `backend/requirements.txt` now lists only what the API imports at runtime (it is what the Docker image installs). The packages only the notebook used (`unstructured`, `tiktoken`, `pandas`, `numpy`) and the test tools (`pytest`, `httpx`) moved to `requirements-dev.txt`, which includes the runtime file. This resolves the old "unused packages in requirements.txt" note.
+- `backend/constraints.txt` pins every version from a known-good environment (Windows-only packages removed). Install with `-c backend/constraints.txt`.
+- `alembic` was added (migrations). `langchain-google-genai` is no longer used by the code; it may still be installed in an old `.venv`.
+- The FAISS index layout changed to versioned directories (`faiss_index/v<…>/` + `CURRENT`). An existing flat `faiss_index/` keeps loading, and its files are removed the next time a collection is created.

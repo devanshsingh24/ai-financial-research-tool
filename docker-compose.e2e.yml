@@ -1,0 +1,26 @@
+# End-to-end test stack: a separate project with its own volumes, API on port 8100.
+#   docker compose -p finsight-e2e -f docker-compose.yml -f docker-compose.e2e.yml up -d --build
+#   FINSIGHT_E2E=1 pytest tests/e2e -q        (starts and removes this stack itself)
+# The API is the production image + tests/, running tests.e2e.fake_app:app: real Postgres,
+# pool, migrations and 2 uvicorn workers, with only the models faked (no keys, no credits).
+services:
+  migrate:
+    environment:
+      LLM_PROVIDER: ollama   # sizes the memory index to the fake embeddings (768)
+
+  api:
+    build: { context: ., target: test }
+    image: finsight-api:test
+    environment:
+      APP_MODULE: tests.e2e.fake_app:app
+      LLM_PROVIDER: ollama
+      WEB_CONCURRENCY: "2"
+      UVICORN_RELOAD: "0"
+    ports: !override
+      - "127.0.0.1:${E2E_API_PORT:-8100}:8000"
+    volumes: !override
+      - app_data:/data
+      - faiss_index:/data/faiss_index
+
+  db:
+    ports: !reset []

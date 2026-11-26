@@ -8,11 +8,10 @@ import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from .config import DATA_DIR
+from . import config
 
 log = logging.getLogger("finsight.web")
 
-_CACHE_PATH = DATA_DIR / "tavily_cache.sqlite"
 _lock = threading.Lock()
 _conn: Optional[sqlite3.Connection] = None
 
@@ -20,8 +19,9 @@ _conn: Optional[sqlite3.Connection] = None
 def _db() -> sqlite3.Connection:
     global _conn
     if _conn is None:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        _conn = sqlite3.connect(_CACHE_PATH, check_same_thread=False)
+        # DATA_DIR is read here, not at import, so tests can point it at a temp dir.
+        config.DATA_DIR.mkdir(parents=True, exist_ok=True)
+        _conn = sqlite3.connect(config.DATA_DIR / "tavily_cache.sqlite", check_same_thread=False)
         _conn.execute(
             "CREATE TABLE IF NOT EXISTS cache ("
             " key TEXT PRIMARY KEY, query TEXT, topic TEXT, time_range TEXT,"

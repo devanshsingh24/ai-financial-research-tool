@@ -1,17 +1,25 @@
+# Runtime dependencies of the FinSight API (also what the Docker image installs).
+# Versions are pinned in backend/constraints.txt (pip install -r ... -c backend/constraints.txt).
+# Notebook-only and test packages are in requirements-dev.txt.
 langchain
-langchain-text-splitters 
-langchain-community 
+langchain-text-splitters
+langchain-community
 langchain-ollama
-faiss-cpu 
-sentence-transformers 
-unstructured 
+langchain-groq           # text model when LLM_PROVIDER=groq
+langchain-huggingface    # local embeddings when LLM_PROVIDER=groq (uses sentence-transformers)
+sentence-transformers    # pulls in torch; Docker installs the CPU-only build first
+faiss-cpu
 beautifulsoup4
-tiktoken
-pandas
-numpy
 langgraph
 langgraph-checkpoint-sqlite
 langchain-tavily
 python-dotenv
 fastapi
 uvicorn[standard]
+# persistence, threads and memory
+aiosqlite
+sqlite-vec
+langgraph-checkpoint-postgres
+psycopg[binary,pool]
+sqlalchemy
+alembic
